@@ -120,6 +120,7 @@ def main() -> None:
     ap.add_argument("--chunk", type=int, default=15, help="1 リクエストに入れる要素数")
     ap.add_argument("--max-elements", type=int, default=0, help="1 画面あたり生成対象にする操作対象要素の上限(0 = 全部)")
     ap.add_argument("--seed", type=int, default=20260920)
+    ap.add_argument("--skip-existing", action="store_true", help="出力ファイルが既にある画面は飛ばす(中断からの再開用)")
     args = ap.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     model = core.resolve_model(args.backend)
@@ -128,6 +129,9 @@ def main() -> None:
         apps = json.load(open(snap))["apps"]
         for app, elements in apps.items():
             t0 = time.time()
+            safe = re.sub(r"[^\w\-]+", "_", app)[:60]
+            if args.skip_existing and (out / f"gen-{safe}.json").exists():
+                print(f"{app}: skip(既存)", flush=True); continue
             res, dropped = gen_screen(app, elements, args.backend, model, args.per_element, args.none, args.chunk,
                                       max_elements=args.max_elements, seed=args.seed)
             safe = re.sub(r"[^\w\-]+", "_", app)[:60]

@@ -157,12 +157,16 @@ class DistillDataset(Dataset):  # type: ignore[misc]
 def build_input_ids(tokenizer: Any, system: str, prompt: str, *, enable_thinking: bool = False) -> list[int]:
     """chakuho core と同じ messages 形(system + user)をチャットテンプレートへ通す。"""
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
-    return tokenizer.apply_chat_template(
+    # tokenize=True の戻り値は transformers の版で list / BatchEncoding と揺れる(5.x は dict)。
+    # テキストにしてから自分でトークン化し、常に list[int] を返す。
+    text = tokenizer.apply_chat_template(
         messages,
-        tokenize=True,
+        tokenize=False,
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
     )
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    return list(ids)
 
 
 def collate(batch: list[dict], tokenizer: Any) -> dict[str, Any]:
@@ -173,12 +177,17 @@ def collate(batch: list[dict], tokenizer: Any) -> dict[str, Any]:
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
+    # 左パディング: 全行の「最後のプロンプト位置」が列 -1 に揃うので、logits_to_keep=1 で
+    # 最終位置の logits だけ計算できる(全位置の logits は batch 8 × 1500 トークン × 語彙 15 万で
+    # 数十 GB を食い、GB10 のユニファイドメモリを使い切って機体が凍結した実測 2026-09-20)。
     input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
     attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
     for i, ids in enumerate(encoded):
-        input_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-        attention_mask[i, : len(ids)] = 1
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "lengths": lengths, "records": batch}
+        input_ids[i, max_len - len(ids):] = torch.tensor(ids, dtype=torch.long)
+        attention_mask[i, max_len - len(ids):] = 1
+    position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp_min(0)
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "position_ids": position_ids,
+            "lengths": lengths, "records": batch}
 
 
 def make_student_decider(model: Any, tokenizer: Any) -> Callable[[str, str, list[str]], dict[str, float]]:
@@ -198,7 +207,7 @@ def make_student_decider(model: Any, tokenizer: Any) -> Callable[[str, str, list
             ids = build_input_ids(tokenizer, system, prompt)
             input_ids = torch.tensor([ids], dtype=torch.long, device=model.device)
             with torch.no_grad():
-                logits = model(input_ids=input_ids).logits[0, -1, :]
+                logits = model(input_ids=input_ids, logits_to_keep=1).logits[0, -1, :]
                 probs = torch.softmax(logits.float(), dim=-1)
             label_ids = label_token_ids(tokenizer, labels)
             return {label: probs[tid].item() for label, tid in zip(labels, label_ids)}
@@ -234,13 +243,16 @@ def train_one_epoch(
         n_batches += 1
         input_ids = batch["input_ids"].to(model.device)
         attention_mask = batch["attention_mask"].to(model.device)
-        out = model(input_ids=input_ids, attention_mask=attention_mask)
+        position_ids = batch["position_ids"].to(model.device)
+        if lm_weight > 0:  # LM 損失には全位置の logits が要る(メモリ大。条件 11 の比較用)
+            out = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids)
+        else:  # 最終位置だけ(左パディングなので列 -1 が全行のプロンプト末尾)
+            out = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, logits_to_keep=1)
         logits = out.logits
 
         batch_loss = torch.zeros((), device=model.device, dtype=torch.float32)
         for i, record in enumerate(batch["records"]):
-            length = batch["lengths"][i]
-            last_logits = logits[i, length - 1, :]
+            last_logits = logits[i, -1, :]
             label_ids = label_token_ids(tokenizer, record["labels"])
             kl = kl_teacher_student(record["teacher"], last_logits, label_ids, record["labels"])
             batch_loss = batch_loss + kl
