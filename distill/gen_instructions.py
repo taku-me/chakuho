@@ -15,6 +15,7 @@ import random
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -80,12 +81,15 @@ def gen_screen(app: str, elements: list[dict], backend: str, model: str, k: int,
         idx, els = idx_els
         prompt = PROMPT.format(app=app, k=k, styles=STYLES, n_none=n_none if idx == 0 else 0,
                                elements="\n".join(element_line(e) for e in els))
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 return parse_json(chat(backend, model, prompt))
             except (ValueError, json.JSONDecodeError):
-                if attempt == 1:
+                if attempt == 2:
                     return None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:  # 共用 backend の過負荷で timeout することがある
+                print(f"  [{app}] chunk {idx}: backend error ({exc}); retry {attempt + 1}/3", flush=True)
+                time.sleep(30 * (attempt + 1))
         return None
 
     with cf.ThreadPoolExecutor(4) as ex:
