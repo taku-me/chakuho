@@ -72,6 +72,7 @@ def main() -> None:
     ap.add_argument("--max-side", type=int, default=512, help="画像の長辺。1.6B VL は 2 枚 × 768px だとエンコーダ予算(2048 トークン)を超えて永久に待たされた実測(512px は 0.24 s)"); ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--threshold", type=float, default=0.5, help="p_pass がこれ未満なら不合格")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--resume", action="store_true", help="--out に既にある画像を飛ばし、追記する(backend 断で落ちた時の再開用)")
     args = ap.parse_args()
     checklist = yaml.safe_load(open(args.checklist)); items = items_of(checklist); system = checklist["common"]["system"].strip()
     ctx = json.load(open(args.context_json)) if args.context_json else {}
@@ -87,8 +88,22 @@ def main() -> None:
             if name.startswith(k): return v
         return ctx.get("_default", "")
     rows = []
-    with open(args.out, "w") as fo, cf.ThreadPoolExecutor(args.workers) as ex:
-        for row in ex.map(lambda p: judge_image(p, ref_url, items, system, ctx_for(p.stem), args.backend, model, args.max_side), paths):
+    if args.resume and Path(args.out).exists():
+        rows = [json.loads(l) for l in open(args.out) if l.strip()]
+        done = {r["file"] for r in rows}
+        paths = [p for p in paths if p.name not in done]
+        print(f"resume: 既存 {len(rows)} 枚、残り {len(paths)} 枚", flush=True)
+
+    def judge_retry(p: Path) -> dict:
+        for attempt in range(3):
+            try:
+                return judge_image(p, ref_url, items, system, ctx_for(p.stem), args.backend, model, args.max_side)
+            except core.BackendError as exc:
+                if attempt == 2: raise
+                print(f"{p.name}: backend error ({exc}); retry {attempt + 1}/3", flush=True); time.sleep(30 * (attempt + 1))
+
+    with open(args.out, "a" if args.resume else "w") as fo, cf.ThreadPoolExecutor(args.workers) as ex:
+        for row in ex.map(judge_retry, paths):
             rows.append(row); fo.write(json.dumps(row, ensure_ascii=False) + "\n"); fo.flush()
             print(f"{row['file']}: {row['seconds']}s  fails={[i for i, v in row['items'].items() if v['p_pass'] < args.threshold]}", flush=True)
     secs = [r["seconds"] for r in rows]
