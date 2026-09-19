@@ -71,7 +71,7 @@ class FakeBackend:
                 n = int(self.headers.get("Content-Length", 0))
                 req = json.loads(self.rfile.read(n))
                 outer.requests.append(req)
-                prompt = req["messages"][-1]["content"]
+                prompt = [m for m in req["messages"] if m["role"] == "user"][-1]["content"]
                 if isinstance(prompt, list):  # 画像パート付き(content parts)の時は text パートだけを読む
                     prompt = "\n".join(part.get("text", "") for part in prompt if part.get("type") == "text")
                 outer.prompts.append(prompt)

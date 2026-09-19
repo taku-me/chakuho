@@ -172,3 +172,18 @@ def test_images_in_state_become_image_parts(backend):
     assert isinstance(backend.requests[-1]["messages"][1]["content"], list)
     plain = core.choice({"app": "x"}, "pick", {"a": "A", "b": "B"}, backend_url=backend.url, model="fake-model")
     assert isinstance(backend.requests[-1]["messages"][1]["content"], str)
+
+
+def test_answer_cue_is_assistant_prefill_by_default(backend, monkeypatch):
+    from chakuho import core
+    monkeypatch.delenv("CHAKUHO_PREFILL", raising=False)
+    core.choice("s", "pick", {"a": "A", "b": "B"}, backend_url=backend.url, model="fake-model")
+    req = backend.requests[-1]
+    assert req["messages"][-1] == {"role": "assistant", "content": "Label:"}
+    assert req["continue_final_message"] is True and req["add_generation_prompt"] is False
+    assert not req["messages"][1]["content"].rstrip().endswith("Label:")
+    monkeypatch.setenv("CHAKUHO_PREFILL", "0")
+    core.choice("s", "pick", {"a": "A", "b": "B"}, backend_url=backend.url, model="fake-model")
+    req = backend.requests[-1]
+    assert req["messages"][-1]["role"] == "user" and req["messages"][-1]["content"].endswith("Label:")
+    assert "continue_final_message" not in req

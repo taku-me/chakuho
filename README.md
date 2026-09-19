@@ -100,6 +100,7 @@ uv run chakuho ask request.json        # ファイルか - で stdin。env CHAKU
 | `CHAKUHO_LOG_KEEP_DAYS` | `90` | これより古い日付のログを削除 |
 | `CHAKUHO_MAX_INFLIGHT` | `16` | backend への同時リクエスト上限 |
 | `CHAKUHO_TOP_LOGPROBS` | `20` | backend に要求する top_logprobs 数。`mlx_lm.server` は上限 11。不正値は既定値に倒す |
+| `CHAKUHO_PREFILL` | `1` | 答えの合図 `Label:` を assistant 側の書き出し(prefill)として送る。`continue_final_message` 非対応の backend では `0`(user 側に書く旧方式) |
 | `CHAKUHO_FALLBACK_BACKEND_URL` | なし | 主 backend が不通の時だけ使う予備 backend。応答の `backend` が `primary` / `fallback` のどちらで答えたかを示す |
 | `CHAKUHO_URL` | `http://localhost:9750/v1/systemone` | クライアント側の宛先 |
 

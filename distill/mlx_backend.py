@@ -165,10 +165,14 @@ class StudentModel:
         """(語彙全体の生 logits, prompt トークン数) を返す。"""
         import mlx.core as mx  # type: ignore
 
+        # chakuho core は答えの合図 "Label:" を assistant 側の書き出し(prefill)として送る。
+        # 最後のメッセージが assistant なら、その続きを生成する形でテンプレートを組む。
+        prefill = bool(messages) and messages[-1].get("role") == "assistant"
         prompt_ids = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
-            add_generation_prompt=True,
+            add_generation_prompt=not prefill,
+            continue_final_message=prefill,
             enable_thinking=enable_thinking,
         )
         input_ids = mx.array([prompt_ids])

@@ -128,6 +128,25 @@ def _render(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+ANSWER_CUE = "Label:"  # 答えの合図。assistant 側の書き出し(prefill)として渡す
+
+
+def prefill_enabled() -> bool:
+    """env CHAKUHO_PREFILL が 0/false/no/off なら user 側に合図を書く旧方式、それ以外は prefill。"""
+    return os.environ.get("CHAKUHO_PREFILL", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _append_cue(content: Any) -> Any:
+    if isinstance(content, str):
+        return content + "\n" + ANSWER_CUE
+    parts = list(content)
+    for part in reversed(parts):
+        if part.get("type") == "text":
+            part["text"] = part["text"] + "\n" + ANSWER_CUE
+            break
+    return parts
+
+
 def _images_of(state: Any) -> list[str]:
     """state が dict で images キーを持てば、その URL 一覧(文字列のみ)を返す。"""
     if isinstance(state, dict):
@@ -138,14 +157,18 @@ def _images_of(state: Any) -> list[str]:
 
 
 def _build_prompt(instructions: str, menu: str, state_text: str, question_line: str, allowed: list[str]) -> str:
-    """instructions -> options -> state -> question -> 'Label:' の順で組む(state は末尾、recency)。"""
+    """instructions -> options -> state -> question の順で組む(state は末尾、recency)。
+
+    答えの合図 "Label:" は user 側には書かず、query_backend が assistant 側の書き出し(prefill)として
+    渡す。user 側に書くと、ラベルが 52 個並ぶ長い一覧の後でモデルが "Label" を復唱して
+    確率質量の 9 割を落とす実測があった(coverage 0.085 → prefill で 0.997、2026-09-20)。
+    """
     return (
         f"INSTRUCTIONS:\n{instructions}\n\n"
         f"OPTIONS:\n{menu}\n\n"
         f"STATE:\n{state_text}\n\n"
         f"QUESTION: {question_line}\n"
-        f"Allowed labels: {', '.join(allowed)}\n"
-        "Label:"
+        f"Allowed labels: {', '.join(allowed)}"
     )
 
 
@@ -188,12 +211,20 @@ def query_backend(
         content: Any = [{"type": "image_url", "image_url": {"url": u}} for u in images] + [{"type": "text", "text": prompt}]
     else:
         content = prompt
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": content},
-        ],
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": content},
+    ]
+    body: dict[str, Any] = {"model": model, "messages": messages}
+    if prefill_enabled():
+        # 答えの合図を assistant 側の書き出しにする(vLLM / 自前 mlx_backend が対応)。
+        # 対応しない backend(mlx_lm.server 等)は CHAKUHO_PREFILL=0 で user 側の "Label:" に戻す
+        messages.append({"role": "assistant", "content": ANSWER_CUE})
+        body["continue_final_message"] = True
+        body["add_generation_prompt"] = False
+    else:
+        messages[1]["content"] = _append_cue(content)
+    body |= {
         "max_tokens": 1,
         "temperature": 0,
         "logprobs": True,

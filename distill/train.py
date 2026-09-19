@@ -156,13 +156,18 @@ class DistillDataset(Dataset):  # type: ignore[misc]
 
 def build_input_ids(tokenizer: Any, system: str, prompt: str, *, enable_thinking: bool = False) -> list[int]:
     """chakuho core と同じ messages 形(system + user)をチャットテンプレートへ通す。"""
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    # chakuho core と同じ形: 答えの合図 "Label:" は assistant 側の書き出し(prefill)。
+    # 教師データの prompt(user 側)には合図が無いので、ここで assistant メッセージとして足し、
+    # continue_final_message で "Label:" の直後の 1 トークンを学生に出させる。
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "Label:"}]
     # tokenize=True の戻り値は transformers の版で list / BatchEncoding と揺れる(5.x は dict)。
     # テキストにしてから自分でトークン化し、常に list[int] を返す。
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True,
+        add_generation_prompt=False,
+        continue_final_message=True,
         enable_thinking=enable_thinking,
     )
     ids = tokenizer(text, add_special_tokens=False)["input_ids"]
