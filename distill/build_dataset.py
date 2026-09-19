@@ -186,6 +186,7 @@ def main() -> None:
     ap.add_argument("--log-dir", default=os.environ.get("CHAKUHO_LOG_DIR", str(Path.home() / ".ato" / "chakuho")))
     ap.add_argument("--seed", type=int, default=20260920)
     ap.add_argument("--limit", type=int, default=0, help="デバッグ用: 例の上限")
+    ap.add_argument("--resume", action="store_true", help="--out に既にある id を飛ばして追記する(backend 断で落ちた時の再開用)")
     ap.add_argument("--breaker-baseline-ms", type=float, default=0, help="ブレーカーの基準 latency(ms)。0 なら chakuho ログの直近中央値")
     args = ap.parse_args()
 
@@ -238,23 +239,39 @@ def main() -> None:
         breaker.wait()
         if breaker.abort:
             return None
-        t0 = time.time()
-        try:
-            r = teacher_label(ex, args.backend, model)
-            breaker.note_result(True, time.time() - t0)
-        except core.BackendError as exc:
-            breaker.note_result(False, time.time() - t0)
-            return {"error": str(exc), "idx": idx}
-        return {"id": f"{ex['meta']['app']}#{idx}", "kind": ex["kind"], **r,
+        rec_id = f"{ex['meta']['app']}#{idx}"
+        if rec_id in done_ids:
+            return {"skip": True}
+        for attempt in range(3):
+            t0 = time.time()
+            try:
+                r = teacher_label(ex, args.backend, model)
+                breaker.note_result(True, time.time() - t0)
+                break
+            except core.BackendError as exc:
+                breaker.note_result(False, time.time() - t0)
+                if attempt == 2:
+                    return {"error": str(exc), "idx": idx}
+                time.sleep(30 * (attempt + 1))  # backend 再起動待ち(自動復帰は 10 分アイドル + 起動 6 分)
+        return {"id": rec_id, "kind": ex["kind"], **r,
                 "meta": {**ex["meta"], "options": r.pop("options"), "expected": ex.get("expected")}}
 
-    kept = dropped_cov = errors = low_conf = 0
+    kept = dropped_cov = errors = low_conf = skipped = 0
     t0 = time.time()
     dropped_path = str(args.out) + ".dropped.jsonl"  # 除外した例(内訳の確認用。学習には使わない)
-    with open(args.out, "w") as fo, open(dropped_path, "w") as fd, cf.ThreadPoolExecutor(args.inflight) as ex:
+    done_ids: set[str] = set()
+    if args.resume:
+        for path in (args.out, dropped_path):
+            if os.path.exists(path):
+                done_ids.update(json.loads(l)["id"] for l in open(path) if l.strip())
+        print(f"resume: 既存 {len(done_ids)} 件を飛ばす", flush=True)
+    mode = "a" if args.resume else "w"
+    with open(args.out, mode) as fo, open(dropped_path, mode) as fd, cf.ThreadPoolExecutor(args.inflight) as ex:
         for i, rec in enumerate(ex.map(label, enumerate(examples))):
             if rec is None:
                 break
+            if "skip" in rec:
+                skipped += 1; continue
             if "error" in rec:
                 errors += 1; continue
             if rec["coverage"] < 0.5:
@@ -267,7 +284,7 @@ def main() -> None:
             if (i + 1) % 200 == 0:
                 print(f"  {i+1}/{len(examples)} 済 ({time.time()-t0:.0f}s)", flush=True)
     stop.set()
-    print(json.dumps({"kept": kept, "dropped_coverage_lt_0.5": dropped_cov, "kept_low_confidence_max_p_lt_0.4": low_conf,
+    print(json.dumps({"kept": kept, "skipped_resume": skipped, "dropped_coverage_lt_0.5": dropped_cov, "kept_low_confidence_max_p_lt_0.4": low_conf,
                       "backend_errors": errors, "aborted": breaker.abort, "breaker_pauses": breaker.pause_count, **stats}, ensure_ascii=False))
 
 

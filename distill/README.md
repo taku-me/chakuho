@@ -24,7 +24,7 @@ python3 -m distill.build_dataset --gen gen/ --snapshots snapshot1.json snapshot2
 
 `build_dataset.py` は共有 vLLM への負荷をサーキットブレーカーで自動抑制する(latency
 中央値が開始時の 2 倍を超えたら一時停止)。除外件数(`coverage < 0.5`)と、保持した
-低確信度件数(`max_p < 0.4`)を実出力に出す。除外した例は `<out>.dropped.jsonl` に
+低確信度件数(`max_p < 0.4`)を実出力に出す。`--resume` は既存の出力にある id を飛ばして追記する(backend 断からの再開用)。除外した例は `<out>.dropped.jsonl` に
 残す(内訳の確認用。学習には使わない)。
 
 ### ④ 学習(CUDA コンテナ内)
