@@ -21,6 +21,7 @@ import glob
 import json
 import os
 import random
+import socket
 import statistics
 import sys
 import threading
@@ -189,6 +190,7 @@ def main() -> None:
     ap.add_argument("--resume", action="store_true", help="--out に既にある id を飛ばして追記する(backend 断で落ちた時の再開用)")
     ap.add_argument("--breaker-baseline-ms", type=float, default=0, help="ブレーカーの基準 latency(ms)。0 なら chakuho ログの直近中央値")
     args = ap.parse_args()
+    socket.setdefaulttimeout(90)  # backend 断で古い接続を掴んだまま止まらないように(urlopen の timeout と別に、ソケット既定も切る)
 
     screens = load_screens(args.snapshots)
     rng = random.Random(args.seed)
