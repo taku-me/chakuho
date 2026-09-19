@@ -250,14 +250,16 @@ def main() -> None:
 
     kept = dropped_cov = errors = low_conf = 0
     t0 = time.time()
-    with open(args.out, "w") as fo, cf.ThreadPoolExecutor(args.inflight) as ex:
+    dropped_path = str(args.out) + ".dropped.jsonl"  # 除外した例(内訳の確認用。学習には使わない)
+    with open(args.out, "w") as fo, open(dropped_path, "w") as fd, cf.ThreadPoolExecutor(args.inflight) as ex:
         for i, rec in enumerate(ex.map(label, enumerate(examples))):
             if rec is None:
                 break
             if "error" in rec:
                 errors += 1; continue
             if rec["coverage"] < 0.5:
-                dropped_cov += 1; continue
+                dropped_cov += 1
+                fd.write(json.dumps(rec, ensure_ascii=False) + "\n"); continue
             if rec["max_p"] < 0.4:
                 low_conf += 1
             stats[rec["kind"]] += 1
