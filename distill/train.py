@@ -307,6 +307,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--eval-every-epoch", action="store_true", help="毎 epoch 評価する(無指定なら最終 epoch のみ)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0, help="デバッグ用: 学習例の上限(smoke test)")
+    ap.add_argument("--no-grad-checkpoint", action="store_true", help="勾配チェックポイントを切る(既定は有効。メモリ優先)")
     ap.add_argument("--merge", action="store_true", help="学習後に LoRA を merge_and_unload しフルモデルを保存する")
     return ap
 
@@ -339,6 +340,9 @@ def main(argv: list[str] | None = None) -> None:
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
+    if not args.no_grad_checkpoint:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()  # LoRA + checkpointing で入力に勾配を通す(定石)
 
     loader = DataLoader(
         DistillDataset(records),
@@ -369,6 +373,8 @@ def main(argv: list[str] | None = None) -> None:
             "n_examples": stats["n_examples"],
             "seconds": round(time.time() - t0, 1),
             "adapter_dir": str(epoch_dir),
+            "gpu_max_alloc_gb": round(torch.cuda.max_memory_allocated() / 2**30, 1) if torch.cuda.is_available() else None,
+            "gpu_max_reserved_gb": round(torch.cuda.max_memory_reserved() / 2**30, 1) if torch.cuda.is_available() else None,
         }
         should_eval = args.eval_cases and (args.eval_every_epoch or epoch == args.epochs)
         if should_eval:
