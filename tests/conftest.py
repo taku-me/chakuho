@@ -72,6 +72,8 @@ class FakeBackend:
                 req = json.loads(self.rfile.read(n))
                 outer.requests.append(req)
                 prompt = req["messages"][-1]["content"]
+                if isinstance(prompt, list):  # 画像パート付き(content parts)の時は text パートだけを読む
+                    prompt = "\n".join(part.get("text", "") for part in prompt if part.get("type") == "text")
                 outer.prompts.append(prompt)
                 if outer.chat_error:
                     self._send(outer.chat_error, {"error": "boom"})

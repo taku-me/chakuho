@@ -51,6 +51,7 @@ SYSTEM_PROMPT = (
 _model_cache: dict[str, str] = {}
 _model_cache_lock = threading.Lock()
 
+IMAGES_KEY = "images"  # state(dict)のこのキーに画像 URL(data: / http)のリストを置くと、VLM backend へ画像パートとして渡す
 NONE_OPTION = "__none__"  # 呼ぶ側が足す「該当なし」。トーナメントでは全チャンクと決勝に必ず含める
 DEFAULT_MAX_INFLIGHT = 16  # backend への同時リクエスト上限(vLLM max-num-seqs 112 を chakuho 単独で埋めない)
 DEFAULT_TOP_LOGPROBS = 20  # mlx_lm.server は上限 11。CHAKUHO_TOP_LOGPROBS で下げる
@@ -123,8 +124,17 @@ def _render(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, dict):
-        return "\n".join(f"{k}: {_render(v)}" for k, v in value.items())
+        return "\n".join(f"{k}: {_render(v)}" for k, v in value.items() if k != IMAGES_KEY)
     return json.dumps(value, ensure_ascii=False)
+
+
+def _images_of(state: Any) -> list[str]:
+    """state が dict で images キーを持てば、その URL 一覧(文字列のみ)を返す。"""
+    if isinstance(state, dict):
+        imgs = state.get(IMAGES_KEY)
+        if isinstance(imgs, list):
+            return [u for u in imgs if isinstance(u, str) and u]
+    return []
 
 
 def _build_prompt(instructions: str, menu: str, state_text: str, question_line: str, allowed: list[str]) -> str:
@@ -166,14 +176,23 @@ def aggregate(
 
 
 def query_backend(
-    prompt: str, backend_url: str, model: str, *, timeout: float = BACKEND_TIMEOUT_SEC
+    prompt: str, backend_url: str, model: str, *, timeout: float = BACKEND_TIMEOUT_SEC,
+    images: list[str] | None = None,
 ) -> tuple[dict[str, float], int]:
-    """backend の /chat/completions へ 1 トークンだけ生成させ、(top_logprobs, prompt_tokens) を返す。"""
+    """backend の /chat/completions へ 1 トークンだけ生成させ、(top_logprobs, prompt_tokens) を返す。
+
+    images があれば user メッセージを OpenAI 互換の content parts(image_url × n + text)にする。
+    画像は prompt テキストの前に置く(VLM backend の prefix cache に載る)。
+    """
+    if images:
+        content: Any = [{"type": "image_url", "image_url": {"url": u}} for u in images] + [{"type": "text", "text": prompt}]
+    else:
+        content = prompt
     body = {
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": content},
         ],
         "max_tokens": 1,
         "temperature": 0,
@@ -247,6 +266,7 @@ def _single_round_choice(
     backend_url: str,
     model: str,
     timeout: float,
+    images: list[str] | None = None,
 ) -> tuple[dict[str, float], float, int]:
     """52 択以下の 1 ラウンド分の choice 判定。(probabilities, coverage, prompt_tokens) を返す。"""
     labels = labels_for(len(options))
@@ -255,7 +275,7 @@ def _single_round_choice(
         for label, option in zip(labels, options, strict=True)
     )
     prompt = _build_prompt(instructions_text, menu, state_text, "choose one option.", labels)
-    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, model, timeout=timeout)
+    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, model, timeout=timeout, images=images)
     dist, coverage = aggregate(top_logprobs, labels, case_insensitive=len(labels) <= 26)
     probabilities = {option: dist[label] for label, option in zip(labels, options, strict=True)}
     return probabilities, coverage, prompt_tokens
@@ -297,7 +317,8 @@ def choice(
 
     if len(options) <= MAX_OPTIONS:
         probabilities, coverage, prompt_tokens = _single_round_choice(
-            state_text, instructions_text, options, descriptions, backend_url, resolved_model, timeout
+            state_text, instructions_text, options, descriptions, backend_url, resolved_model, timeout,
+            images=_images_of(state),
         )
         best = max(probabilities, key=probabilities.get)
         result: dict[str, Any] = {
@@ -324,7 +345,8 @@ def choice(
 
     def _run_chunk(chunk: list[str]) -> tuple[list[str], int]:
         probs, _coverage, tokens = _single_round_choice(
-            state_text, instructions_text, chunk, descriptions, backend_url, resolved_model, timeout
+            state_text, instructions_text, chunk, descriptions, backend_url, resolved_model, timeout,
+            images=_images_of(state),
         )
         ranked = sorted((o for o in chunk if o != NONE_OPTION), key=lambda o: probs[o], reverse=True)
         return ranked[:top_k], tokens
@@ -339,7 +361,8 @@ def choice(
     qualifying_tokens = sum(tokens for _winners, tokens in chunk_results)
 
     final_probabilities, final_coverage, final_tokens = _single_round_choice(
-        state_text, instructions_text, winners, descriptions, backend_url, resolved_model, timeout
+        state_text, instructions_text, winners, descriptions, backend_url, resolved_model, timeout,
+        images=_images_of(state),
     )
     final_best = max(final_probabilities, key=final_probabilities.get)
 
@@ -377,7 +400,7 @@ def noul(
     menu = f"yes: {described.get('true', 'yes')}\nno: {described.get('false', 'no')}"
     prompt = _build_prompt(_render(instructions), menu, _render(state), "yes or no.", ["yes", "no"])
     resolved_model = model or resolve_model(backend_url, timeout=timeout)
-    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, resolved_model, timeout=timeout)
+    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, resolved_model, timeout=timeout, images=_images_of(state))
     dist, coverage = aggregate(top_logprobs, ["yes", "no"], case_insensitive=True)
     result: dict[str, Any] = {
         "noul": dist["yes"],
@@ -411,7 +434,7 @@ def score(
     menu = "\n".join(f"{label}: {level}" for label, level in zip(labels, levels, strict=True))
     prompt = _build_prompt(_render(instructions), menu, _render(state), "rate on this scale.", labels)
     resolved_model = model or resolve_model(backend_url, timeout=timeout)
-    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, resolved_model, timeout=timeout)
+    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, resolved_model, timeout=timeout, images=_images_of(state))
     dist, coverage = aggregate(top_logprobs, labels, case_insensitive=len(labels) <= 26)
     probabilities = {level: dist[label] for label, level in zip(labels, levels, strict=True)}
     n = len(labels)

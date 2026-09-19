@@ -155,3 +155,20 @@ def test_top_logprobs_env_invalid_falls_back_to_default(monkeypatch, capsys):
     monkeypatch.delenv("CHAKUHO_TOP_LOGPROBS")
     assert core.top_logprobs_limit() == core.DEFAULT_TOP_LOGPROBS
     assert "不正" in capsys.readouterr().err
+
+
+def test_images_in_state_become_image_parts(backend):
+    """state.images の URL は user content の image_url パートになり、prompt テキストには混ざらない。"""
+    from chakuho import core
+    state = {"app": "x", "images": ["data:image/png;base64,AAAA", "https://example.invalid/b.png"]}
+    r = core.choice(state, "pick", {"a": "A", "b": "B"}, backend_url=backend.url, model="fake-model")
+    assert r["choice"] == "a"
+    req = backend.requests[-1]
+    content = req["messages"][1]["content"]
+    assert isinstance(content, list) and [c["type"] for c in content] == ["image_url", "image_url", "text"]
+    assert content[0]["image_url"]["url"].startswith("data:image/png")
+    assert "images" not in content[2]["text"] and "app: x" in content[2]["text"]
+    n = core.noul(state, "ok?", backend_url=backend.url, model="fake-model")
+    assert isinstance(backend.requests[-1]["messages"][1]["content"], list)
+    plain = core.choice({"app": "x"}, "pick", {"a": "A", "b": "B"}, backend_url=backend.url, model="fake-model")
+    assert isinstance(backend.requests[-1]["messages"][1]["content"], str)
