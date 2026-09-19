@@ -106,11 +106,11 @@ def make_handler(backend_url: str, log: DecisionLog | None,
             payload: dict[str, Any] = {"backend": backend_url, "fallback_backend": fallback_backend_url}
             if fallback_backend_url:
                 try:
-                    payload["fallback_model"] = core.resolve_model(fallback_backend_url, timeout=10)
+                    payload["fallback_model"] = core.probe_backend(fallback_backend_url, timeout=10)
                 except core.BackendError as exc:
                     payload["fallback_error"] = str(exc)
             try:
-                payload["model"] = core.resolve_model(backend_url, timeout=10)
+                payload["model"] = core.probe_backend(backend_url, timeout=10)
             except core.BackendError as exc:
                 payload["error"] = str(exc)
                 if "fallback_model" in payload:  # 主が死んでいても fallback で判定できるなら稼働扱い

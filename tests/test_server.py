@@ -73,6 +73,22 @@ def test_backend_down_503_and_health(chakuho_server, backend):
         assert json.loads(e.read())["ok"] is False
 
 
+def test_health_reflects_backend_without_cache_clear(chakuho_server, backend):
+    """モデル ID がキャッシュ済みでも、/health は backend を実際に叩いて生死を返す(裏の vLLM 停止中に ok:true を返した実害の再発防止)。"""
+    base, _ = chakuho_server
+    with urllib_request.urlopen(base + "/health", timeout=10) as r:
+        assert json.loads(r.read())["ok"] is True  # ここでモデル ID がキャッシュされる
+    backend.models_ok = False
+    try:
+        urllib_request.urlopen(base + "/health", timeout=10)
+        assert False, "expected 503"
+    except urllib_error.HTTPError as e:
+        assert e.code == 503 and json.loads(e.read())["ok"] is False
+    backend.models_ok = True
+    with urllib_request.urlopen(base + "/health", timeout=10) as r:
+        assert json.loads(r.read())["ok"] is True
+
+
 def test_health_ok(chakuho_server):
     base, _ = chakuho_server
     with urllib_request.urlopen(base + "/health", timeout=10) as r:

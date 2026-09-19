@@ -264,6 +264,11 @@ def resolve_model(backend_url: str, *, timeout: float = BACKEND_TIMEOUT_SEC) -> 
         cached = _model_cache.get(backend_url)
     if cached:
         return cached
+    return probe_backend(backend_url, timeout=timeout)
+
+
+def probe_backend(backend_url: str, *, timeout: float = BACKEND_TIMEOUT_SEC) -> str:
+    """backend の /models を毎回実際に叩いてモデル ID を返す(キャッシュを使わない。/health の生死判定用)。"""
     url = backend_url.rstrip("/") + "/models"
     req = urllib_request.Request(url, method="GET")
     try:
