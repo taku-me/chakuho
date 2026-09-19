@@ -10,6 +10,12 @@ dependencies = []
 [project.scripts]
 chakuho = "chakuho.cli:main"
 
+[project.optional-dependencies]
+bench = [
+    "pillow>=12.3.0",
+    "pyyaml>=6.0.3",
+]
+
 [dependency-groups]
 dev = ["pytest>=8"]
 

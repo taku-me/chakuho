@@ -69,7 +69,7 @@ def main() -> None:
     ap.add_argument("--checklist", required=True); ap.add_argument("--ref", required=True); ap.add_argument("--images", required=True)
     ap.add_argument("--out", required=True); ap.add_argument("--backend", default=core.DEFAULT_BACKEND_URL); ap.add_argument("--model")
     ap.add_argument("--approved", default=""); ap.add_argument("--context-json", help='{"stem_prefix": "scene intent", ...}')
-    ap.add_argument("--max-side", type=int, default=768); ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--max-side", type=int, default=512, help="画像の長辺。1.6B VL は 2 枚 × 768px だとエンコーダ予算(2048 トークン)を超えて永久に待たされた実測(512px は 0.24 s)"); ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--threshold", type=float, default=0.5, help="p_pass がこれ未満なら不合格")
     ap.add_argument("--workers", type=int, default=2)
     args = ap.parse_args()
