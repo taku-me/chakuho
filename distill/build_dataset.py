@@ -186,6 +186,7 @@ def main() -> None:
     ap.add_argument("--log-dir", default=os.environ.get("CHAKUHO_LOG_DIR", str(Path.home() / ".ato" / "chakuho")))
     ap.add_argument("--seed", type=int, default=20260920)
     ap.add_argument("--limit", type=int, default=0, help="デバッグ用: 例の上限")
+    ap.add_argument("--breaker-baseline-ms", type=float, default=0, help="ブレーカーの基準 latency(ms)。0 なら chakuho ログの直近中央値")
     args = ap.parse_args()
 
     screens = load_screens(args.snapshots)
@@ -223,7 +224,7 @@ def main() -> None:
 
     core.configure_inflight(args.inflight)
     model = core.resolve_model(args.backend)
-    breaker = Breaker(Path(args.log_dir))
+    breaker = Breaker(Path(args.log_dir), baseline_ms=args.breaker_baseline_ms or None)
     print(f"[breaker] baseline latency {breaker.baseline:.0f}ms(chakuho ログの直近中央値)", flush=True)
     stop = threading.Event()
 
