@@ -244,8 +244,16 @@ def train_one_epoch(
     n = 0
     optimizer.zero_grad()
     n_batches = 0
+    t_start = time.time()
+    tokens_seen = 0
     for step, batch in enumerate(loader):
         n_batches += 1
+        tokens_seen += int(batch["attention_mask"].sum())
+        if step % 25 == 0 and step > 0:
+            elapsed = time.time() - t_start
+            print(json.dumps({"step": step, "of": len(loader), "kl_running": round(total_kl / max(1, n), 4),
+                              "tokens_per_s": round(tokens_seen / elapsed), "elapsed_s": round(elapsed),
+                              "eta_epoch_s": round(elapsed / step * (len(loader) - step))}), flush=True)
         input_ids = batch["input_ids"].to(model.device)
         attention_mask = batch["attention_mask"].to(model.device)
         position_ids = batch["position_ids"].to(model.device)
@@ -330,7 +338,7 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"{args.data} に例が無い")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="cuda")
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map="cuda", attn_implementation="sdpa")
 
     lora_config = LoraConfig(
         r=args.lora_r,
