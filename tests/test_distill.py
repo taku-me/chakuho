@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib import error as urllib_error
@@ -155,6 +156,119 @@ def test_score_cases_partial_mass_is_reported_as_coverage():
     summary = distill_eval.score_cases(cases, decide)
     assert summary["accuracy"]["all"]["ok"] == 1
     assert summary["coverage_lt_0_5"] == {"count": 1, "total": 1, "rate": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# distill/eval.py: score_cases のトーナメント経路(候補 > 52、core.choice() と同じ 2 段)
+# ---------------------------------------------------------------------------
+
+_MENU_LINE_RE = re.compile(r"^([A-Za-z]): (.+) — ")
+
+
+def _labels_in_prompt(prompt: str) -> dict[str, str]:
+    """menu の 'label: option — desc' 行から {option: label} を作る(テスト用、本番コードは読まない)。"""
+    mapping: dict[str, str] = {}
+    for line in prompt.splitlines():
+        m = _MENU_LINE_RE.match(line)
+        if m:
+            mapping[m.group(2)] = m.group(1)
+    return mapping
+
+
+def _content_based_decide(target_option: str, *, prompts: list[str] | None = None, label_counts: list[int] | None = None):
+    """prompt の menu に target_option が出てくるラウンドでだけ高い mass を返す fake。
+
+    score_cases のトーナメントは呼び出し順を跨いで束→決勝と進むため、_planned_decide の
+    「呼び出し順に計画したラベルを返す」方式ではラウンドを跨いだ検証ができない。
+    menu の中身(本番コードが組んだプロンプト)から judge するので、実装の内部構造に依存しない。
+    """
+
+    def decide(system: str, prompt: str, labels: list[str]) -> dict[str, float]:
+        assert system == core.SYSTEM_PROMPT
+        if prompts is not None:
+            prompts.append(prompt)
+        if label_counts is not None:
+            label_counts.append(len(labels))
+        mapping = _labels_in_prompt(prompt)
+        target_label = mapping.get(target_option)
+        return {label: (0.9 if label == target_label else 0.01) for label in labels}
+
+    return decide
+
+
+def test_score_cases_tournament_scores_129_options_without_crashing():
+    """#(20時間蒸留の後で落ちた実害): 候補129個(52を超える)が例外なく採点できること。"""
+    criteria = {f"option-{i}": f"desc-{i}" for i in range(129)}
+    target = "option-100"  # 3束中2つ目の束に入る位置(0-51/52-103/104-128)
+    cases = [make_case("0-orig", criteria=criteria, expected=[target])]
+
+    label_counts: list[int] = []
+    decide = _content_based_decide(target, label_counts=label_counts)
+
+    summary = distill_eval.score_cases(cases, decide)
+
+    assert summary["errors"] == 0
+    assert summary["accuracy"]["all"] == {"ok": 1, "total": 1, "pct": 100.0}
+    assert all(n <= core.MAX_OPTIONS for n in label_counts)
+
+
+def test_score_cases_tournament_keeps_none_in_every_chunk_and_final():
+    """__none__ は全ての予選束と決勝に含まれる(本番 core.choice() と同じ扱い)。"""
+    contenders = {f"option-{i}": f"desc-{i}" for i in range(80)}
+    criteria = {**contenders, NONE: "該当なし"}
+    cases = [make_case("0-orig", criteria=criteria, expected=[NONE])]
+
+    prompts: list[str] = []
+    label_counts: list[int] = []
+    decide = _content_based_decide(NONE, prompts=prompts, label_counts=label_counts)
+
+    summary = distill_eval.score_cases(cases, decide)
+
+    assert summary["accuracy"]["all"] == {"ok": 1, "total": 1, "pct": 100.0}
+    # per_chunk=51(NONE分を引く)、contenders=80 -> 束は51+29の2つ、+決勝の計3ラウンド
+    assert len(prompts) == 3
+    assert label_counts == [52, 30, 51]  # 各束は本体+NONE、決勝は上位25*2+NONE
+    assert all(n <= core.MAX_OPTIONS for n in label_counts)
+    assert all(NONE in p for p in prompts), "__none__ が含まれないラウンドがある"
+
+
+def test_score_cases_exactly_max_options_is_single_round_not_tournament():
+    """52 個ちょうど(境界)はこれまで通り 1 ラウンドのまま(トーナメント化されない)。"""
+    criteria = {f"option-{i}": f"desc-{i}" for i in range(52)}
+    target = "option-10"
+    cases = [make_case("0-orig", criteria=criteria, expected=[target])]
+
+    label_counts: list[int] = []
+    decide = _content_based_decide(target, label_counts=label_counts)
+
+    summary = distill_eval.score_cases(cases, decide)
+
+    assert summary["accuracy"]["all"]["ok"] == 1
+    assert label_counts == [52]  # 1 回だけ、52 ラベル全部で決着
+
+
+def test_score_cases_small_cases_unaffected_by_tournament_change(monkeypatch):
+    """候補 52 個以下のケースは、これまでと同じ選択・同じ decide 呼び出し回数(回帰しない)。"""
+    cases = [
+        make_case("0-orig", criteria={"1: [AXButton] Save": "w", "2: [AXButton] Cancel": "w", NONE: "n"}, expected=["AXButton:Save"]),
+        make_case("1-orig", criteria={"3: [AXButton] X": "w", NONE: "n"}, expected=[NONE]),
+    ]
+    decide = _planned_decide(["A", "B"])
+    summary = distill_eval.score_cases(cases, decide)
+    assert summary["accuracy"]["all"] == {"ok": 2, "total": 2, "pct": 100.0}
+    assert summary["coverage_lt_0_5"]["count"] == 0
+
+
+def test_score_cases_raises_when_options_exceed_tournament_limit():
+    """core.choice() と同じ上限(2704)を超えたら ValueError(decide は呼ばれない)。"""
+    criteria = {f"option-{i}": "d" for i in range(core.MAX_TOURNAMENT_OPTIONS + 1)}
+    cases = [make_case("0-orig", criteria=criteria, expected=["option-0"])]
+
+    def decide(system, prompt, labels):
+        raise AssertionError("decide は呼ばれてはいけない")
+
+    with pytest.raises(ValueError, match="prefilter options"):
+        distill_eval.score_cases(cases, decide)
 
 
 # ---------------------------------------------------------------------------

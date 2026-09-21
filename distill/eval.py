@@ -127,16 +127,12 @@ def format_table(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _choice_prompt(case: dict) -> tuple[str, str, list[str], list[str]]:
-    """case の request から chakuho core と同じ prompt を組む。
-
-    Returns:
-        (system, prompt, labels, options) — options[i] は labels[i] に対応する元の選択肢名。
-    """
+def _round_prompt(case: dict, options: list[str]) -> tuple[str, str, list[str]]:
+    """options(52 以下、1 ラウンド分)に対して chakuho core と同じ system/prompt/labels を組む。"""
     question = case["request"]["questions"]["target"]
-    options = list(question["criteria"].keys())
+    criteria = question["criteria"]
     labels = core.labels_for(len(options))
-    menu = "\n".join(f"{label}: {option} — {question['criteria'][option]}" for label, option in zip(labels, options))
+    menu = "\n".join(f"{label}: {option} — {criteria[option]}" for label, option in zip(labels, options))
     prompt = core._build_prompt(
         core._render(question.get("instructions", "")),
         menu,
@@ -144,10 +140,63 @@ def _choice_prompt(case: dict) -> tuple[str, str, list[str], list[str]]:
         "choose one option.",
         labels,
     )
-    return core.SYSTEM_PROMPT, prompt, labels, options
+    return core.SYSTEM_PROMPT, prompt, labels
+
+
+def _choice_prompt(case: dict) -> tuple[str, str, list[str], list[str]]:
+    """case の request 全選択肢(52 以下)から chakuho core と同じ prompt を組む。
+
+    Returns:
+        (system, prompt, labels, options) — options[i] は labels[i] に対応する元の選択肢名。
+    """
+    options = list(case["request"]["questions"]["target"]["criteria"].keys())
+    system, prompt, labels = _round_prompt(case, options)
+    return system, prompt, labels, options
 
 
 DecideFn = Callable[[str, str, list[str]], dict[str, float]]
+
+
+def _decide_round(case: dict, options: list[str], decide: DecideFn) -> dict[str, float]:
+    """options(52 以下、1 ラウンド分)を decide し、ラベルではなく option 名をキーにした raw mass を返す。"""
+    system, prompt, labels = _round_prompt(case, options)
+    raw = decide(system, prompt, labels)
+    return {option: raw.get(label, 0.0) for label, option in zip(labels, options)}
+
+
+def _tournament_decide(case: dict, options: list[str], decide: DecideFn) -> dict[str, float]:
+    """52 個を超える選択肢を、chakuho core.choice() と同じ 2 段トーナメントで decide する。
+
+    52 個(__none__ があれば 51 個)ずつの束へ分けて束ごとに decide し、各束の上位
+    k 個(k = 束あたりの定員 // 束数)を決勝へ進める。__none__ は全ての束と決勝に必ず
+    含める(束の得票には数えない)。予選落ちした選択肢の raw mass は 0.0 として返す
+    (core.choice() の「予選落ち・決勝敗退は probabilities 0.0」と同じ扱い)。
+
+    core.choice() は束ごとの decide を ThreadPoolExecutor で並列に投げるが、ここでは
+    直列に呼ぶ。decide は HTTP ではなく in-process のモデル呼び出し(train.py の
+    make_student_decider はスレッドセーフでない model.eval()/model.train() 切り替えを
+    含む)なので、並列化すると結果が変わらなくても壊れうる。束の処理順序・上位k個の
+    選び方は core.choice() と同じなので、並列/直列で最終結果(選択・probabilities)は
+    変わらない — 変わるのは実行時間だけ。
+    """
+    has_none = core.NONE_OPTION in options
+    contenders = [o for o in options if o != core.NONE_OPTION]
+    per_chunk = core.MAX_OPTIONS - (1 if has_none else 0)
+    chunks = [contenders[i : i + per_chunk] for i in range(0, len(contenders), per_chunk)]
+    if has_none:
+        chunks = [chunk + [core.NONE_OPTION] for chunk in chunks]
+    top_k = max(1, per_chunk // len(chunks))
+
+    winners: list[str] = []
+    for chunk in chunks:
+        raw = _decide_round(case, chunk, decide)
+        ranked = sorted((o for o in chunk if o != core.NONE_OPTION), key=lambda o: raw[o], reverse=True)
+        winners.extend(ranked[:top_k])
+    if has_none:
+        winners.append(core.NONE_OPTION)
+
+    final_raw = _decide_round(case, winners, decide)
+    return {option: final_raw.get(option, 0.0) for option in options}
 
 
 def score_cases(cases: list[dict], decide: DecideFn) -> dict[str, Any]:
@@ -155,18 +204,27 @@ def score_cases(cases: list[dict], decide: DecideFn) -> dict[str, Any]:
 
     raw_mass は正規化前でよい(合計 < 1 なら coverage として扱う)。全滅(合計 0)の時は
     一様分布とみなし choice は先頭ラベルになる(core.aggregate の degraded 挙動に合わせる)。
+    候補が 52 個を超えるケースは core.choice() と同じ 2 段トーナメント(_tournament_decide)
+    で decide する。2704 個(core.MAX_TOURNAMENT_OPTIONS)を超えると core.choice() と同じ
+    ValueError になる。
     """
     answers: dict[str, dict[str, Any]] = {}
     for case in cases:
-        system, prompt, labels, options = _choice_prompt(case)
-        raw = decide(system, prompt, labels)
-        coverage = sum(raw.get(label, 0.0) for label in labels)
-        if coverage <= 0:
-            dist = {label: 1.0 / len(labels) for label in labels}
+        options = list(case["request"]["questions"]["target"]["criteria"].keys())
+        if len(options) > core.MAX_TOURNAMENT_OPTIONS:
+            raise ValueError(
+                f"prefilter options to {core.MAX_TOURNAMENT_OPTIONS} or fewer (got {len(options)})"
+            )
+        if len(options) <= core.MAX_OPTIONS:
+            raw = _decide_round(case, options, decide)
         else:
-            dist = {label: raw.get(label, 0.0) / coverage for label in labels}
-        best_label = max(dist, key=dist.get)
-        best_option = options[labels.index(best_label)]
+            raw = _tournament_decide(case, options, decide)
+        coverage = sum(raw.values())
+        if coverage <= 0:
+            dist = {option: 1.0 / len(options) for option in options}
+        else:
+            dist = {option: raw.get(option, 0.0) / coverage for option in options}
+        best_option = max(dist, key=dist.get)
         answers[case["case_id"]] = {"choice": best_option, "coverage": coverage}
     return summarize(cases, answers)
 
