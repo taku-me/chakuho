@@ -208,6 +208,16 @@ def score_cases(cases: list[dict], decide: DecideFn) -> dict[str, Any]:
     で decide する。2704 個(core.MAX_TOURNAMENT_OPTIONS)を超えると core.choice() と同じ
     ValueError になる。
     """
+    return summarize(cases, decide_cases(cases, decide))
+
+
+def decide_cases(cases: list[dict], decide: DecideFn) -> dict[str, dict[str, Any]]:
+    """score_cases と同じ経路でケース単位の答えを出す(集計しない)。
+
+    返すのは ``{case_id: {"choice": str, "coverage": float}}``。
+    bench/run_labels.py が書く labels-*.json と同じ形なので、
+    Jev や教師の labels-*.json とそのまま突き合わせられる。
+    """
     answers: dict[str, dict[str, Any]] = {}
     for case in cases:
         options = list(case["request"]["questions"]["target"]["criteria"].keys())
@@ -226,7 +236,7 @@ def score_cases(cases: list[dict], decide: DecideFn) -> dict[str, Any]:
             dist = {option: raw.get(option, 0.0) / coverage for option in options}
         best_option = max(dist, key=dist.get)
         answers[case["case_id"]] = {"choice": best_option, "coverage": coverage}
-    return summarize(cases, answers)
+    return answers
 
 
 def score_cases_via_url(cases: list[dict], url: str, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
