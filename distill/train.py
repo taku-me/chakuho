@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -297,6 +298,51 @@ def train_one_epoch(
     return {"kl_mean": total_kl / max(1, n), "n_examples": n}
 
 
+def resolve_start_epoch(resume_adapter: str | None, start_epoch: int) -> int:
+    """何 epoch 目から数え直すかを決める。
+
+    明示された ``--start-epoch`` が最優先。無指定(0)の時は ``--resume-adapter`` の
+    ディレクトリ名 ``epoch-N`` から N+1 を導く。再開なしなら 1。
+
+    Raises:
+        ValueError: 再開するのに epoch 番号を導けない(``--start-epoch`` が要る)場合。
+    """
+    if start_epoch > 0:
+        return start_epoch
+    if not resume_adapter:
+        return 1
+    name = Path(resume_adapter.rstrip("/")).name
+    m = re.fullmatch(r"epoch-(\d+)", name)
+    if not m:
+        raise ValueError(f"--resume-adapter のディレクトリ名から epoch 番号を導けない: {name}。--start-epoch を指定する")
+    return int(m.group(1)) + 1
+
+
+def epoch_numbers(start_epoch: int, epochs: int) -> list[int]:
+    """この実行で回す epoch 番号の並び。"""
+    if start_epoch < 1:
+        raise ValueError(f"start_epoch は 1 以上: {start_epoch}")
+    if epochs < 1:
+        raise ValueError(f"epochs は 1 以上: {epochs}")
+    return list(range(start_epoch, start_epoch + epochs))
+
+
+def check_resume_adapter(path: str) -> Path:
+    """再開元の LoRA アダプタが実在することを確かめる。"""
+    d = Path(path)
+    if not (d / "adapter_config.json").is_file():
+        raise FileNotFoundError(f"LoRA アダプタが無い(adapter_config.json が見つからない): {d}")
+    return d
+
+
+def assert_epoch_dirs_free(out_dir: Path, numbers: list[int]) -> None:
+    """これから書く epoch ディレクトリが既存を上書きしないことを確かめる。"""
+    for n in numbers:
+        d = Path(out_dir) / f"epoch-{n}"
+        if d.exists():
+            raise FileExistsError(f"{d} が既にある。上書きを避けるため中止する(--start-epoch を進める)")
+
+
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="distill/build_dataset.py の出力 (jsonl)")
@@ -316,6 +362,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0, help="デバッグ用: 学習例の上限(smoke test)")
     ap.add_argument("--no-grad-checkpoint", action="store_true", help="勾配チェックポイントを切る(既定は有効。メモリ優先)")
+    ap.add_argument("--resume-adapter", default=None, help="保存済み LoRA アダプタのディレクトリから再開する(例: out/epoch-1)")
+    ap.add_argument("--start-epoch", type=int, default=0, help="epoch 番号の開始値。0 なら --resume-adapter 名から導く(無ければ 1)")
     ap.add_argument("--merge", action="store_true", help="学習後に LoRA を merge_and_unload しフルモデルを保存する")
     return ap
 
@@ -324,7 +372,7 @@ def main(argv: list[str] | None = None) -> None:
     args = build_argparser().parse_args(argv)
     _require_torch()
 
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
     random.seed(args.seed)
@@ -333,6 +381,11 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    start_epoch = resolve_start_epoch(args.resume_adapter, args.start_epoch)
+    epochs_to_run = epoch_numbers(start_epoch, args.epochs)
+    assert_epoch_dirs_free(out_dir, epochs_to_run)
+    resume_dir = check_resume_adapter(args.resume_adapter) if args.resume_adapter else None
+
     records = load_dataset_jsonl(args.data, limit=args.limit)
     if not records:
         raise ValueError(f"{args.data} に例が無い")
@@ -340,14 +393,20 @@ def main(argv: list[str] | None = None) -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map="cuda", attn_implementation="sdpa")
 
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules="all-linear",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
+    if resume_dir is not None:
+        # 保存済みアダプタの続きから学習する。LoraConfig は保存側の adapter_config.json を使う
+        # (r / alpha / target_modules を実行時引数で変えると形が合わないため)。
+        model = PeftModel.from_pretrained(model, str(resume_dir), is_trainable=True)
+        print(json.dumps({"resumed_from": str(resume_dir), "start_epoch": start_epoch}, ensure_ascii=False), flush=True)
+    else:
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules="all-linear",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
     if not args.no_grad_checkpoint:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()  # LoRA + checkpointing で入力に勾配を通す(定石)
@@ -366,7 +425,7 @@ def main(argv: list[str] | None = None) -> None:
         optimizer, num_warmup_steps=max(1, total_steps // 20), num_training_steps=total_steps
     )
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in epochs_to_run:
         t0 = time.time()
         stats = train_one_epoch(
             model, tokenizer, loader, optimizer, scheduler, lm_weight=args.lm_weight, grad_accum=args.grad_accum
@@ -377,6 +436,8 @@ def main(argv: list[str] | None = None) -> None:
         record: dict[str, Any] = {
             "epoch": epoch,
             "epochs": args.epochs,
+            "epochs_to_run": epochs_to_run,
+            "resumed_from": str(resume_dir) if resume_dir else None,
             "kl_mean": stats["kl_mean"],
             "n_examples": stats["n_examples"],
             "seconds": round(time.time() - t0, 1),
@@ -384,7 +445,7 @@ def main(argv: list[str] | None = None) -> None:
             "gpu_max_alloc_gb": round(torch.cuda.max_memory_allocated() / 2**30, 1) if torch.cuda.is_available() else None,
             "gpu_max_reserved_gb": round(torch.cuda.max_memory_reserved() / 2**30, 1) if torch.cuda.is_available() else None,
         }
-        should_eval = args.eval_cases and (args.eval_every_epoch or epoch == args.epochs)
+        should_eval = args.eval_cases and (args.eval_every_epoch or epoch == epochs_to_run[-1])
         if should_eval:
             record["eval"] = run_eval(model, tokenizer, args.eval_cases)
             if args.eval_cases2:

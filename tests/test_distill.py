@@ -592,3 +592,78 @@ def test_torch_dependent_functions_fail_clearly_without_torch():
         distill_train.train_one_epoch(None, None, None, None, None, lm_weight=0.0, grad_accum=1)
     with pytest.raises(RuntimeError):
         distill_train.make_student_decider(None, None)
+
+
+# ---------------------------------------------------------------------------
+# distill/train.py: 保存済みアダプタからの再開(--resume-adapter / --start-epoch)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_start_epoch_defaults_to_1_without_resume():
+    assert distill_train.resolve_start_epoch(None, 0) == 1
+
+
+def test_resolve_start_epoch_derives_next_epoch_from_adapter_dir_name():
+    assert distill_train.resolve_start_epoch("/data/run-46/out/epoch-1", 0) == 2
+    assert distill_train.resolve_start_epoch("/data/run-46/out/epoch-7/", 0) == 8
+
+
+def test_resolve_start_epoch_explicit_value_wins_over_dir_name():
+    assert distill_train.resolve_start_epoch("/data/run-46/out/epoch-1", 5) == 5
+
+
+def test_resolve_start_epoch_raises_when_dir_name_is_not_derivable():
+    with pytest.raises(ValueError):
+        distill_train.resolve_start_epoch("/data/run-46/out/best", 0)
+
+
+def test_epoch_numbers_counts_forward_from_start():
+    assert distill_train.epoch_numbers(2, 1) == [2]
+    assert distill_train.epoch_numbers(2, 3) == [2, 3, 4]
+
+
+def test_epoch_numbers_rejects_non_positive():
+    with pytest.raises(ValueError):
+        distill_train.epoch_numbers(0, 1)
+    with pytest.raises(ValueError):
+        distill_train.epoch_numbers(1, 0)
+
+
+def test_check_resume_adapter_returns_path_when_adapter_config_present(tmp_path):
+    d = tmp_path / "epoch-1"
+    d.mkdir()
+    (d / "adapter_config.json").write_text("{}", encoding="utf-8")
+    assert distill_train.check_resume_adapter(str(d)) == d
+
+
+def test_check_resume_adapter_raises_when_missing(tmp_path):
+    d = tmp_path / "epoch-1"
+    d.mkdir()
+    with pytest.raises(FileNotFoundError):
+        distill_train.check_resume_adapter(str(d))
+
+
+def test_assert_epoch_dirs_free_raises_when_target_would_be_overwritten(tmp_path):
+    (tmp_path / "epoch-2").mkdir()
+    with pytest.raises(FileExistsError):
+        distill_train.assert_epoch_dirs_free(tmp_path, [2, 3])
+
+
+def test_assert_epoch_dirs_free_passes_when_only_earlier_epochs_exist(tmp_path):
+    (tmp_path / "epoch-1").mkdir()
+    distill_train.assert_epoch_dirs_free(tmp_path, [2, 3])
+
+
+def test_argparser_accepts_resume_adapter_and_start_epoch():
+    args = distill_train.build_argparser().parse_args(
+        ["--data", "d.jsonl", "--model", "m", "--out", "o",
+         "--resume-adapter", "/data/run-46/out/epoch-1", "--start-epoch", "2"]
+    )
+    assert args.resume_adapter == "/data/run-46/out/epoch-1"
+    assert args.start_epoch == 2
+
+
+def test_argparser_defaults_have_no_resume():
+    args = distill_train.build_argparser().parse_args(["--data", "d.jsonl", "--model", "m", "--out", "o"])
+    assert args.resume_adapter is None
+    assert args.start_epoch == 0
