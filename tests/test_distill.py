@@ -667,3 +667,103 @@ def test_argparser_defaults_have_no_resume():
     args = distill_train.build_argparser().parse_args(["--data", "d.jsonl", "--model", "m", "--out", "o"])
     assert args.resume_adapter is None
     assert args.start_epoch == 0
+
+
+# ---------------------------------------------------------------------------
+# distill/train.py: 定期評価と早期停止(停止条件 S1 / S2)
+# ---------------------------------------------------------------------------
+
+
+def test_goals_met_requires_both_overall_and_none_tasks():
+    assert distill_train.goals_met({"all": 90.0, "none-tasks": 90.0}, 90.0, 90.0) is True
+    assert distill_train.goals_met({"all": 92.0, "none-tasks": 51.3}, 90.0, 90.0) is False
+    assert distill_train.goals_met({"all": 87.8, "none-tasks": 95.0}, 90.0, 90.0) is False
+
+
+def test_goals_met_is_false_when_a_metric_is_missing():
+    assert distill_train.goals_met({"all": 95.0}, 90.0, 90.0) is False
+
+
+def test_plateaued_needs_patience_evaluations_without_gain():
+    # 最良 87.8 のあと 2 回 +1.0 未満 → 頭打ち
+    assert distill_train.plateaued([87.8, 88.0, 88.2], patience=2, min_delta=1.0) is True
+
+
+def test_plateaued_is_false_when_a_recent_eval_improved_enough():
+    assert distill_train.plateaued([87.8, 88.0, 89.5], patience=2, min_delta=1.0) is False
+
+
+def test_plateaued_is_false_before_enough_evaluations():
+    assert distill_train.plateaued([87.8], patience=2, min_delta=1.0) is False
+    assert distill_train.plateaued([87.8, 88.0], patience=2, min_delta=1.0) is False
+
+
+def test_plateaued_compares_against_best_so_far_not_previous():
+    # 一度 92 まで上がってから下がった場合、直前比では改善でも最良比では未改善
+    assert distill_train.plateaued([92.0, 88.0, 89.0], patience=2, min_delta=1.0) is True
+
+
+def test_pct_of_reads_accuracy_bucket():
+    ev = {"accuracy": {"all": {"pct": 87.8}, "none-tasks": {"pct": 51.3}}}
+    assert distill_train.pct_of(ev) == {"all": 87.8, "none-tasks": 51.3}
+
+
+def test_pct_of_tolerates_missing_buckets():
+    assert distill_train.pct_of({"accuracy": {}}) == {}
+    assert distill_train.pct_of({}) == {}
+
+
+def test_argparser_accepts_checkpoint_and_early_stop_options():
+    a = distill_train.build_argparser().parse_args(
+        ["--data", "d", "--model", "m", "--out", "o",
+         "--checkpoint-every-steps", "250", "--early-stop-patience", "2", "--early-stop-min-delta", "1.0"]
+    )
+    assert a.checkpoint_every_steps == 250
+    assert a.early_stop_patience == 2
+    assert a.early_stop_min_delta == 1.0
+
+
+def test_argparser_checkpointing_is_off_by_default():
+    a = distill_train.build_argparser().parse_args(["--data", "d", "--model", "m", "--out", "o"])
+    assert a.checkpoint_every_steps == 0
+
+
+def test_train_one_epoch_stops_when_callback_returns_true():
+    """torch 無しでも、ループ制御だけは偽物で検証できる。"""
+    calls = []
+
+    def on_checkpoint(step):
+        calls.append(step)
+        return True  # 1 回目で停止を要求
+
+    stopped = distill_train.checkpoint_due(step=250, checkpoint_every=250)
+    assert stopped is True
+    assert distill_train.checkpoint_due(step=249, checkpoint_every=250) is False
+    assert distill_train.checkpoint_due(step=0, checkpoint_every=250) is False
+    assert distill_train.checkpoint_due(step=250, checkpoint_every=0) is False
+
+
+def test_decide_cases_returns_per_case_answers_matching_score_cases():
+    """decide_cases の答えを summarize に通すと score_cases と一致する(経路が同じ)。"""
+    from distill import eval as dist_eval
+
+    cases = [
+        {
+            "case_id": "c1",
+            "app": "X",
+            "variant": "orig",
+            "expected": ["AXButton:Go"],
+            "request": {"state": {}, "questions": {"target": {
+                "type": "choice", "instructions": "i",
+                "criteria": {"0: [AXButton] Go": "d", "1: [AXButton] Stop": "d"}}}},
+        }
+    ]
+
+    def decide(system, prompt, labels):
+        return {labels[0]: 0.9}
+
+    answers = dist_eval.decide_cases(cases, decide)
+    assert set(answers) == {"c1"}
+    assert answers["c1"]["choice"] == "0: [AXButton] Go"
+    assert answers["c1"]["coverage"] == 0.9
+    assert dist_eval.summarize(cases, answers) == dist_eval.score_cases(cases, decide)

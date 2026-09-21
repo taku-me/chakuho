@@ -238,6 +238,8 @@ def train_one_epoch(
     *,
     lm_weight: float,
     grad_accum: int,
+    checkpoint_every: int = 0,
+    on_checkpoint: Callable[[int], bool] | None = None,
 ) -> dict[str, float]:
     _require_torch()
     model.train()
@@ -255,6 +257,12 @@ def train_one_epoch(
             print(json.dumps({"step": step, "of": len(loader), "kl_running": round(total_kl / max(1, n), 4),
                               "tokens_per_s": round(tokens_seen / elapsed), "elapsed_s": round(elapsed),
                               "eta_epoch_s": round(elapsed / step * (len(loader) - step))}), flush=True)
+        if on_checkpoint is not None and checkpoint_due(step, checkpoint_every):
+            # 評価は model.eval() へ切り替えるので、戻してから学習を続ける
+            stop = on_checkpoint(step)
+            model.train()
+            if stop:
+                break
         input_ids = batch["input_ids"].to(model.device)
         attention_mask = batch["attention_mask"].to(model.device)
         position_ids = batch["position_ids"].to(model.device)
@@ -295,7 +303,7 @@ def train_one_epoch(
         scheduler.step()
         optimizer.zero_grad()
 
-    return {"kl_mean": total_kl / max(1, n), "n_examples": n}
+    return {"kl_mean": total_kl / max(1, n), "n_examples": n, "steps_run": n_batches}
 
 
 def resolve_start_epoch(resume_adapter: str | None, start_epoch: int) -> int:
@@ -343,6 +351,41 @@ def assert_epoch_dirs_free(out_dir: Path, numbers: list[int]) -> None:
             raise FileExistsError(f"{d} が既にある。上書きを避けるため中止する(--start-epoch を進める)")
 
 
+def pct_of(evaluation: dict[str, Any]) -> dict[str, float]:
+    """``run_eval`` の結果から、バケット名 → 正答率(%)だけを取り出す。"""
+    buckets = (evaluation or {}).get("accuracy") or {}
+    return {k: v["pct"] for k, v in buckets.items() if isinstance(v, dict) and "pct" in v}
+
+
+def goals_met(pcts: dict[str, float], overall_target: float, none_target: float) -> bool:
+    """停止条件 S1: 全体と「該当なし」の両方が目標に届いたか。
+
+    どちらかが欠けている時は False(測れていないものを達成扱いにしない)。
+    """
+    if "all" not in pcts or "none-tasks" not in pcts:
+        return False
+    return pcts["all"] >= overall_target and pcts["none-tasks"] >= none_target
+
+
+def plateaued(history: list[float], *, patience: int, min_delta: float) -> bool:
+    """停止条件 S2: 直近 ``patience`` 回が、それ以前の最良から ``min_delta`` 以上改善していないか。
+
+    比較先は「直前」ではなく「それまでの最良」。一度上がってから下がった場合に
+    直前比だと改善に見えてしまうため(下がったのは改善ではない)。
+    """
+    if patience < 1 or len(history) <= patience:
+        return False
+    best_before = max(history[: -patience])
+    return all(v - best_before < min_delta for v in history[-patience:])
+
+
+def checkpoint_due(step: int, checkpoint_every: int) -> bool:
+    """この step で定期チェックポイント(保存 + 評価)を行うか。"""
+    if checkpoint_every <= 0 or step <= 0:
+        return False
+    return step % checkpoint_every == 0
+
+
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="distill/build_dataset.py の出力 (jsonl)")
@@ -362,6 +405,11 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0, help="デバッグ用: 学習例の上限(smoke test)")
     ap.add_argument("--no-grad-checkpoint", action="store_true", help="勾配チェックポイントを切る(既定は有効。メモリ優先)")
+    ap.add_argument("--checkpoint-every-steps", type=int, default=0, help="N step ごとにアダプタを保存し 336 ベンチを当てる(0 で無効)")
+    ap.add_argument("--early-stop-patience", type=int, default=2, help="停止条件 S2: 何回続けて改善が無ければ止めるか")
+    ap.add_argument("--early-stop-min-delta", type=float, default=1.0, help="停止条件 S2: 改善とみなす最小のポイント差")
+    ap.add_argument("--goal-overall", type=float, default=90.0, help="停止条件 S1: 全体正答率の目標(G1)")
+    ap.add_argument("--goal-none", type=float, default=90.0, help="停止条件 S1: 該当なしの目標(G2)")
     ap.add_argument("--resume-adapter", default=None, help="保存済み LoRA アダプタのディレクトリから再開する(例: out/epoch-1)")
     ap.add_argument("--start-epoch", type=int, default=0, help="epoch 番号の開始値。0 なら --resume-adapter 名から導く(無ければ 1)")
     ap.add_argument("--merge", action="store_true", help="学習後に LoRA を merge_and_unload しフルモデルを保存する")
@@ -425,10 +473,36 @@ def main(argv: list[str] | None = None) -> None:
         optimizer, num_warmup_steps=max(1, total_steps // 20), num_training_steps=total_steps
     )
 
+    # 停止条件 S1(目標達成)/ S2(頭打ち)。定義は台帳 TASKS.md、実体はこの2つの純粋関数
+    eval_history: list[float] = []
+    stop_reason: str | None = None
+
+    def on_checkpoint(step: int) -> bool:
+        """N step ごとにアダプタを保存し 336 ベンチを当て、停止条件を判定する。"""
+        nonlocal stop_reason
+        ck_dir = out_dir / f"epoch-{epoch}-step-{step}"
+        model.save_pretrained(ck_dir)
+        rec: dict[str, Any] = {"checkpoint_step": step, "epoch": epoch, "adapter_dir": str(ck_dir)}
+        if args.eval_cases:
+            ev = run_eval(model, tokenizer, args.eval_cases)
+            pcts = pct_of(ev)
+            eval_history.append(pcts.get("all", 0.0))
+            rec["eval_pct"] = pcts
+            rec["eval_history"] = list(eval_history)
+            if goals_met(pcts, args.goal_overall, args.goal_none):
+                stop_reason = "S1_goals_met"
+            elif plateaued(eval_history, patience=args.early_stop_patience, min_delta=args.early_stop_min_delta):
+                stop_reason = "S2_plateau"
+            rec["stop_reason"] = stop_reason
+        print(json.dumps(rec, ensure_ascii=False), flush=True)
+        return stop_reason is not None
+
     for epoch in epochs_to_run:
         t0 = time.time()
         stats = train_one_epoch(
-            model, tokenizer, loader, optimizer, scheduler, lm_weight=args.lm_weight, grad_accum=args.grad_accum
+            model, tokenizer, loader, optimizer, scheduler, lm_weight=args.lm_weight, grad_accum=args.grad_accum,
+            checkpoint_every=args.checkpoint_every_steps,
+            on_checkpoint=on_checkpoint if args.checkpoint_every_steps > 0 else None,
         )
         epoch_dir = out_dir / f"epoch-{epoch}"
         model.save_pretrained(epoch_dir)
@@ -440,6 +514,8 @@ def main(argv: list[str] | None = None) -> None:
             "resumed_from": str(resume_dir) if resume_dir else None,
             "kl_mean": stats["kl_mean"],
             "n_examples": stats["n_examples"],
+            "steps_run": stats.get("steps_run"),
+            "stop_reason": stop_reason,
             "seconds": round(time.time() - t0, 1),
             "adapter_dir": str(epoch_dir),
             "gpu_max_alloc_gb": round(torch.cuda.max_memory_allocated() / 2**30, 1) if torch.cuda.is_available() else None,
@@ -451,6 +527,8 @@ def main(argv: list[str] | None = None) -> None:
             if args.eval_cases2:
                 record["eval_holdout"] = run_eval(model, tokenizer, args.eval_cases2)
         print(json.dumps(record, ensure_ascii=False), flush=True)
+        if stop_reason is not None:
+            break
 
     if args.merge:
         merged = model.merge_and_unload()
