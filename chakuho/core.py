@@ -60,7 +60,12 @@ _model_cache_lock = threading.Lock()
 
 IMAGES_KEY = "images"  # state(dict)のこのキーに画像 URL(data: / http)のリストを置くと、VLM backend へ画像パートとして渡す
 NONE_OPTION = "__none__"  # 呼ぶ側が足す「該当なし」。トーナメントでは全チャンクと決勝に必ず含める
-DEFAULT_MAX_INFLIGHT = 16  # backend への同時リクエスト上限(vLLM max-num-seqs 112 を chakuho 単独で埋めない)
+# backend への同時リクエスト上限。backend が同時に処理できる本数に合わせる。
+# 超えて投げた分は backend 側で待たされ、その待ち時間が BACKEND_TIMEOUT_SEC に数えられて 503 になる。
+# SGLang の実際の上限は起動ログの「max_running_requests is capped to N by the mamba state cache」で見る
+# (/get_server_info の max_running_requests はこの制限を反映しない)。
+# journalctl --user -u resident-llm -b | grep 'capped to'
+DEFAULT_MAX_INFLIGHT = 4
 DEFAULT_TOP_LOGPROBS = 20  # mlx_lm.server は上限 11。CHAKUHO_TOP_LOGPROBS で下げる
 
 ESTIMATOR_SAMPLING = "sampling"

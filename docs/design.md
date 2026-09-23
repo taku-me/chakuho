@@ -42,7 +42,7 @@ Jev 互換 API なので呼び出し側は将来 Jev 本体や別モデルに差
 - 53 個以上の選択肢は chakuho 内で 2 段トーナメント: 52 個ずつのチャンクへ分け(並列)、各チャンクの上位 k 個(k = max(1, 52 // チャンク数))を集めて決勝を 1 回。上位 1 個だけでなく上位 k 個を通すのは、強い候補が同じチャンクで潰し合う偏りを減らすため。`__none__` があれば全チャンクと決勝に含める。返り値の `probabilities` は決勝の分布(落選したものは 0)、`stages: 2` を付ける。上限は 52×52=2704 で、超えたら HTTP 400
 - backend 呼び出しは timeout 60 秒。失敗は HTTP 503 と `{"error": ...}`。ハングさせない
 - 全リクエストを `CHAKUHO_LOG_DIR/decisions-YYYYMMDD.jsonl` に日付別で追記(state 全文、質問、答え、latency)。較正データ・回帰比較(下記)の元になる。起動時と日付切替時に `CHAKUHO_LOG_KEEP_DAYS`(既定 90)より古いファイルを削除する
-- backend への同時リクエスト数はセマフォで上限 `CHAKUHO_MAX_INFLIGHT`(既定 16)。超えた分は待つ
+- backend への同時リクエスト数はセマフォで上限 `CHAKUHO_MAX_INFLIGHT`(既定 4)。超えた分は chakuho 側で待つ。backend 側で待たせると、その待ち時間がタイムアウトに数えられて 503 になるため、backend が同時に処理できる本数に合わせる
 
 ### 推定方式(`CHAKUHO_ESTIMATOR`、既定 `sampling`)
 
