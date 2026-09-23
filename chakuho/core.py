@@ -1,8 +1,14 @@
 """chakuho(択法)— System One 型の判定エンジン。
 
 生成しない判定: state と、答えの形を宣言した questions を受け取り、
-バックエンド(OpenAI 互換 API)へ 1 トークンだけ生成させ、その logprobs を
-宣言済みラベル上の確率分布へ集約して返す。設計は docs/design.md を参照。
+バックエンド(OpenAI 互換 API)へ 1 トークンだけ生成させ、宣言済みラベル上の
+確率分布へ集約して返す。推定方式は 2 つ(CHAKUHO_ESTIMATOR で切替、既定 sampling):
+- sampling(既定): n 個の 1 トークンサンプル(temperature 1.0)を要求し、ラベルの
+  出現頻度を数えて分布にする。logprobs を要求しないため、logprobs 未対応の
+  backend(SGLang+投機的デコード等)でも動く
+- logprobs: 1 回の生成の top_logprobs(temperature 0)をラベルへ集約する。
+  backend が対応していれば使える旧方式
+設計は docs/design.md を参照。
 
     from chakuho import core
     core.evaluate({"screen": "..."}, {"q1": {"type": "choice", ...}})
@@ -17,8 +23,9 @@
 - score: 段階(低→高)のリストから、期待値を 0..1 に正規化して返す
 
 選択肢・段階には A-Z, a-z の順でラベルを振る(1 ラウンドの上限 52)。coverage は
-top_logprobs のうち宣言ラベルへ載った確率質量。0 なら一様分布を返し
-"degraded": true を付ける(判定できなかったことを、判定した体で返さない)。
+sampling なら宣言ラベルに載ったサンプルの割合、logprobs なら top_logprobs のうち
+宣言ラベルへ載った確率質量。0 なら一様分布を返し "degraded": true を付ける
+(判定できなかったことを、判定した体で返さない)。
 """
 
 from __future__ import annotations
@@ -56,11 +63,18 @@ NONE_OPTION = "__none__"  # 呼ぶ側が足す「該当なし」。トーナメ�
 DEFAULT_MAX_INFLIGHT = 16  # backend への同時リクエスト上限(vLLM max-num-seqs 112 を chakuho 単独で埋めない)
 DEFAULT_TOP_LOGPROBS = 20  # mlx_lm.server は上限 11。CHAKUHO_TOP_LOGPROBS で下げる
 
+ESTIMATOR_SAMPLING = "sampling"
+ESTIMATOR_LOGPROBS = "logprobs"
+DEFAULT_ESTIMATOR = ESTIMATOR_SAMPLING  # SGLang+投機的デコードが logprobs を拒否するため(2026-09-23)
+DEFAULT_SAMPLES = 16  # bench/sampling_n_sweep.py の実測(n=16/32/64)で選定。根拠は docs/design.md
+
 _inflight: threading.BoundedSemaphore | None = None
 _inflight_lock = threading.Lock()
 
 
 _top_logprobs_warned = False
+_estimator_warned = False
+_samples_warned = False
 
 
 def top_logprobs_limit() -> int:
@@ -79,6 +93,39 @@ def top_logprobs_limit() -> int:
             print(f"chakuho: CHAKUHO_TOP_LOGPROBS={raw!r} は不正。既定値 {DEFAULT_TOP_LOGPROBS} を使う", file=sys.stderr)
             _top_logprobs_warned = True
         return DEFAULT_TOP_LOGPROBS
+
+
+def estimator_mode() -> str:
+    """CHAKUHO_ESTIMATOR(sampling|logprobs)。未設定・不正なら既定値(sampling)へ倒し、不正時のみ一度警告する。"""
+    global _estimator_warned
+    raw = os.environ.get("CHAKUHO_ESTIMATOR")
+    if raw is None:
+        return DEFAULT_ESTIMATOR
+    value = raw.strip().lower()
+    if value in (ESTIMATOR_SAMPLING, ESTIMATOR_LOGPROBS):
+        return value
+    if not _estimator_warned:
+        print(f"chakuho: CHAKUHO_ESTIMATOR={raw!r} は不正。既定値 {DEFAULT_ESTIMATOR!r} を使う", file=sys.stderr)
+        _estimator_warned = True
+    return DEFAULT_ESTIMATOR
+
+
+def sample_count() -> int:
+    """sampling 推定の n。env CHAKUHO_SAMPLES が不正(非整数・1 未満)なら既定値へ倒し、一度だけ警告する。"""
+    global _samples_warned
+    raw = os.environ.get("CHAKUHO_SAMPLES")
+    if raw is None:
+        return DEFAULT_SAMPLES
+    try:
+        value = int(raw)
+        if value < 1:
+            raise ValueError(raw)
+        return value
+    except ValueError:
+        if not _samples_warned:
+            print(f"chakuho: CHAKUHO_SAMPLES={raw!r} は不正。既定値 {DEFAULT_SAMPLES} を使う", file=sys.stderr)
+            _samples_warned = True
+        return DEFAULT_SAMPLES
 
 
 def configure_inflight(limit: int | None = None) -> threading.BoundedSemaphore:
@@ -198,6 +245,36 @@ def aggregate(
     return {label: value / coverage for label, value in mass.items()}, coverage
 
 
+def aggregate_counts(
+    samples: list[str], labels: list[str], *, case_insensitive: bool = False
+) -> tuple[dict[str, float], float]:
+    """n 個の 1 トークンサンプル(生成テキスト)を宣言ラベルへ集約し、正規化した分布と
+    coverage(宣言ラベルに載ったサンプルの割合)を返す。aggregate() のサンプリング版。
+
+    case_insensitive の意味は aggregate() と同じ。宣言ラベルに一致しないサンプル
+    (空文字列・ラベル外のトークン・投機的デコードの副作用で空になったもの等)は
+    無視される。1 件も一致しなければ一様分布を返し coverage=0.0("degraded")。
+    """
+    counts = {label: 0 for label in labels}
+    lowered_lookup = {label.lower(): label for label in labels} if case_insensitive else {}
+    matched = 0
+    for sample in samples:
+        key = sample.strip()
+        if case_insensitive:
+            match = lowered_lookup.get(key.lower())
+        else:
+            match = key if key in counts else None
+        if match is not None:
+            counts[match] += 1
+            matched += 1
+    total = len(samples)
+    coverage = matched / total if total else 0.0
+    if matched == 0:
+        n = len(labels)
+        return {label: 1.0 / n for label in labels}, 0.0
+    return {label: value / matched for label, value in counts.items()}, coverage
+
+
 def query_backend(
     prompt: str, backend_url: str, model: str, *, timeout: float = BACKEND_TIMEOUT_SEC,
     images: list[str] | None = None,
@@ -253,6 +330,88 @@ def query_backend(
     except (KeyError, IndexError, TypeError) as exc:
         raise BackendError(f"unexpected response shape from {url}: {exc}") from exc
     return top_logprobs, prompt_tokens
+
+
+def _strip_sample_text(content: str | None) -> str:
+    """sampling 応答の1件を整形する。prefill(continue_final_message)対応 backend は
+    ANSWER_CUE を含まない差分だけを返すのが実測済みの通例だが(2026-09-23、GX10 SGLang)、
+    プレフィックスを含めて返す backend への備えとして先頭一致なら剥がす。"""
+    text = content or ""
+    if prefill_enabled() and text.startswith(ANSWER_CUE):
+        text = text[len(ANSWER_CUE):]
+    return text.strip()
+
+
+def query_backend_sampling(
+    prompt: str, backend_url: str, model: str, *, n: int, timeout: float = BACKEND_TIMEOUT_SEC,
+    images: list[str] | None = None,
+) -> tuple[list[str], int]:
+    """backend の /chat/completions へ n 個の 1 トークンサンプルを要求し、
+    (各サンプルの生成テキスト n 個, prompt_tokens) を返す。
+
+    logprobs は一切要求しない(SGLang+投機的デコードが return_logprob 非対応で
+    HTTP 400 を返すため、2026-09-23 実測)。temperature は 1.0 固定
+    (艦隊の temperature=0 禁止方針の例外は query_backend の logprobs 経路のみ)。
+    """
+    if images:
+        content: Any = [{"type": "image_url", "image_url": {"url": u}} for u in images] + [{"type": "text", "text": prompt}]
+    else:
+        content = prompt
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": content},
+    ]
+    body: dict[str, Any] = {"model": model, "messages": messages}
+    if prefill_enabled():
+        messages.append({"role": "assistant", "content": ANSWER_CUE})
+        body["continue_final_message"] = True
+        body["add_generation_prompt"] = False
+    else:
+        messages[1]["content"] = _append_cue(content)
+    body |= {
+        "max_tokens": 1,
+        "temperature": 1.0,
+        "n": n,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    url = backend_url.rstrip("/") + "/chat/completions"
+    req = urllib_request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with _get_inflight():
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise BackendError(f"backend request to {url} failed: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise BackendError(f"backend {url} returned invalid JSON: {exc}") from exc
+    try:
+        samples = [_strip_sample_text(choice_["message"]["content"]) for choice_ in data["choices"]]
+        prompt_tokens = data["usage"]["prompt_tokens"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise BackendError(f"unexpected response shape from {url}: {exc}") from exc
+    return samples, prompt_tokens
+
+
+def _query_distribution(
+    prompt: str, labels: list[str], backend_url: str, model: str, timeout: float,
+    images: list[str] | None, *, case_insensitive: bool,
+) -> tuple[dict[str, float], float, int]:
+    """backend へ問い合わせ、宣言ラベル上の分布・coverage・prompt_tokens を返す。
+    CHAKUHO_ESTIMATOR(既定 sampling)で logprobs/sampling を切り替える一本化窓口。"""
+    if estimator_mode() == ESTIMATOR_LOGPROBS:
+        top_logprobs, prompt_tokens = query_backend(prompt, backend_url, model, timeout=timeout, images=images)
+        dist, coverage = aggregate(top_logprobs, labels, case_insensitive=case_insensitive)
+    else:
+        samples, prompt_tokens = query_backend_sampling(
+            prompt, backend_url, model, n=sample_count(), timeout=timeout, images=images
+        )
+        dist, coverage = aggregate_counts(samples, labels, case_insensitive=case_insensitive)
+    return dist, coverage, prompt_tokens
 
 
 def resolve_model(backend_url: str, *, timeout: float = BACKEND_TIMEOUT_SEC) -> str:
@@ -311,8 +470,9 @@ def _single_round_choice(
         for label, option in zip(labels, options, strict=True)
     )
     prompt = _build_prompt(instructions_text, menu, state_text, "choose one option.", labels)
-    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, model, timeout=timeout, images=images)
-    dist, coverage = aggregate(top_logprobs, labels, case_insensitive=len(labels) <= 26)
+    dist, coverage, prompt_tokens = _query_distribution(
+        prompt, labels, backend_url, model, timeout, images, case_insensitive=len(labels) <= 26
+    )
     probabilities = {option: dist[label] for label, option in zip(labels, options, strict=True)}
     return probabilities, coverage, prompt_tokens
 
@@ -436,8 +596,9 @@ def noul(
     menu = f"yes: {described.get('true', 'yes')}\nno: {described.get('false', 'no')}"
     prompt = _build_prompt(_render(instructions), menu, _render(state), "yes or no.", ["yes", "no"])
     resolved_model = model or resolve_model(backend_url, timeout=timeout)
-    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, resolved_model, timeout=timeout, images=_images_of(state))
-    dist, coverage = aggregate(top_logprobs, ["yes", "no"], case_insensitive=True)
+    dist, coverage, prompt_tokens = _query_distribution(
+        prompt, ["yes", "no"], backend_url, resolved_model, timeout, _images_of(state), case_insensitive=True
+    )
     result: dict[str, Any] = {
         "noul": dist["yes"],
         "probability": dist["yes"],  # Jev(Gateway 表記)互換の別名
@@ -470,8 +631,9 @@ def score(
     menu = "\n".join(f"{label}: {level}" for label, level in zip(labels, levels, strict=True))
     prompt = _build_prompt(_render(instructions), menu, _render(state), "rate on this scale.", labels)
     resolved_model = model or resolve_model(backend_url, timeout=timeout)
-    top_logprobs, prompt_tokens = query_backend(prompt, backend_url, resolved_model, timeout=timeout, images=_images_of(state))
-    dist, coverage = aggregate(top_logprobs, labels, case_insensitive=len(labels) <= 26)
+    dist, coverage, prompt_tokens = _query_distribution(
+        prompt, labels, backend_url, resolved_model, timeout, _images_of(state), case_insensitive=len(labels) <= 26
+    )
     probabilities = {level: dist[label] for label, level in zip(labels, levels, strict=True)}
     n = len(labels)
     expected = sum(i * dist[label] for i, label in enumerate(labels)) / (n - 1) if n > 1 else 0.0

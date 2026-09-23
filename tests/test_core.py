@@ -174,6 +174,170 @@ def test_images_in_state_become_image_parts(backend):
     assert isinstance(backend.requests[-1]["messages"][1]["content"], str)
 
 
+def test_aggregate_counts_normalizes_within_labels_and_reports_coverage():
+    # 10 サンプル: A x6, B x2, 宣言ラベル外 x2 -> coverage は宣言ラベルに乗った割合(8/10)
+    samples = ["A"] * 6 + ["B"] * 2 + ["<junk>", ""]
+    dist, cover = core.aggregate_counts(samples, ["A", "B"])
+    assert dist["A"] == pytest.approx(6 / 8)
+    assert dist["B"] == pytest.approx(2 / 8)
+    assert cover == pytest.approx(0.8)
+
+
+def test_aggregate_counts_strips_whitespace_before_matching():
+    dist, cover = core.aggregate_counts([" A", "A ", "B"], ["A", "B"])
+    assert cover == pytest.approx(1.0)
+    assert dist["A"] == pytest.approx(2 / 3)
+
+
+def test_aggregate_counts_case_insensitive_for_word_labels():
+    dist, cover = core.aggregate_counts(["Yes", "yes", "NO"], ["yes", "no"], case_insensitive=True)
+    assert cover == pytest.approx(1.0)
+    assert dist["yes"] == pytest.approx(2 / 3)
+    assert dist["no"] == pytest.approx(1 / 3)
+
+
+def test_aggregate_counts_zero_matches_is_uniform_and_degraded_signal():
+    dist, cover = core.aggregate_counts(["<junk>", "", "???"], ["A", "B", "C"])
+    assert cover == 0.0
+    assert all(v == pytest.approx(1 / 3) for v in dist.values())
+
+
+def test_aggregate_counts_empty_sample_list_is_uniform_zero_coverage():
+    dist, cover = core.aggregate_counts([], ["A", "B"])
+    assert cover == 0.0
+    assert dist == {"A": 0.5, "B": 0.5}
+
+
+def test_estimator_mode_defaults_to_sampling(monkeypatch):
+    monkeypatch.delenv("CHAKUHO_ESTIMATOR", raising=False)
+    assert core.estimator_mode() == core.ESTIMATOR_SAMPLING == "sampling"
+
+
+def test_estimator_mode_invalid_falls_back_to_sampling(monkeypatch, capsys):
+    monkeypatch.setattr(core, "_estimator_warned", False)
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "bogus")
+    assert core.estimator_mode() == core.ESTIMATOR_SAMPLING
+    assert "不正" in capsys.readouterr().err
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "logprobs")
+    assert core.estimator_mode() == core.ESTIMATOR_LOGPROBS
+
+
+def test_sample_count_env_invalid_falls_back_to_default(monkeypatch, capsys):
+    monkeypatch.setattr(core, "_samples_warned", False)
+    monkeypatch.delenv("CHAKUHO_SAMPLES", raising=False)
+    assert core.sample_count() == core.DEFAULT_SAMPLES
+    monkeypatch.setenv("CHAKUHO_SAMPLES", "abc")
+    assert core.sample_count() == core.DEFAULT_SAMPLES
+    assert "不正" in capsys.readouterr().err
+    monkeypatch.setenv("CHAKUHO_SAMPLES", "0")
+    assert core.sample_count() == core.DEFAULT_SAMPLES
+    monkeypatch.setenv("CHAKUHO_SAMPLES", "8")
+    assert core.sample_count() == 8
+
+
+def test_query_backend_sampling_requests_no_logprobs_temperature_one(backend, monkeypatch):
+    """sampling リクエストは logprobs/top_logprobs を一切含めず、temperature=1.0・n を指定する
+    (SGLang+投機的デコードが logprobs 付きリクエストを 400 で拒否するため)。"""
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "sampling")
+    backend.sample_responder = lambda prompt, menu, n: ["A"] * n
+    core.choice("s", "pick", {"a": "A", "b": "B"}, backend_url=backend.url, model="fake-model")
+    req = backend.requests[-1]
+    assert req["n"] == core.DEFAULT_SAMPLES
+    assert req["temperature"] == 1.0
+    assert "logprobs" not in req and "top_logprobs" not in req
+    assert req["messages"][-1] == {"role": "assistant", "content": "Label:"}
+    assert req["continue_final_message"] is True
+
+
+def test_choice_sampling_counts_labels_into_probabilities(backend, monkeypatch):
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "sampling")
+    monkeypatch.setenv("CHAKUHO_SAMPLES", "10")
+    # B x8, A x2 -> y(B) が勝つ
+    backend.sample_responder = lambda prompt, menu, n: (["B"] * 8 + ["A"] * 2)
+    out = core.choice("s", "pick", {"x": "first", "y": "second"}, backend_url=backend.url)
+    assert out["choice"] == "y"
+    assert out["stages"] == 1
+    assert out["coverage"] == pytest.approx(1.0)
+    assert out["probabilities"]["y"] == pytest.approx(0.8)
+    assert out["probabilities"]["x"] == pytest.approx(0.2)
+    assert "degraded" not in out
+
+
+def test_choice_sampling_degraded_when_no_sample_hits_label(backend, monkeypatch):
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "sampling")
+    backend.sample_responder = lambda prompt, menu, n: [""] * n
+    out = core.choice("s", "pick", ["x", "y"], backend_url=backend.url)
+    assert out["degraded"] is True
+    assert out["coverage"] == 0.0
+    assert out["probabilities"] == {"x": 0.5, "y": 0.5}
+
+
+def test_noul_sampling(backend, monkeypatch):
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "sampling")
+    monkeypatch.setenv("CHAKUHO_SAMPLES", "10")
+    backend.sample_responder = lambda prompt, menu, n: (["yes"] * 7 + ["no"] * 3)
+    out = core.noul("s", "is it?", backend_url=backend.url)
+    assert out["noul"] == pytest.approx(0.7)
+    assert out["coverage"] == pytest.approx(1.0)
+
+
+def test_score_sampling(backend, monkeypatch):
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "sampling")
+    monkeypatch.setenv("CHAKUHO_SAMPLES", "10")
+    # 3 段階 low=A mid=B high=C: A x2, B x3, C x5 -> 期待値 (2*0+3*0.5+5*1)/10
+    backend.sample_responder = lambda prompt, menu, n: (["A"] * 2 + ["B"] * 3 + ["C"] * 5)
+    out = core.score("s", "how bad", ["low", "mid", "high"], backend_url=backend.url)
+    assert out["score"] == pytest.approx((3 * 0.5 + 5 * 1.0) / 10)
+    assert out["probabilities"]["high"] == pytest.approx(0.5)
+
+
+def test_strip_sample_text_removes_leading_cue_when_prefill_enabled(monkeypatch):
+    monkeypatch.delenv("CHAKUHO_PREFILL", raising=False)  # prefill 既定 有効
+    assert core._strip_sample_text("Label: A") == "A"
+    assert core._strip_sample_text(" A") == "A"  # 実バックエンド(SGLang)は差分のみを返す(prefix なし)
+    assert core._strip_sample_text("") == ""
+    assert core._strip_sample_text(None) == ""
+
+
+def test_strip_sample_text_leaves_content_untouched_when_prefill_disabled(monkeypatch):
+    monkeypatch.setenv("CHAKUHO_PREFILL", "0")
+    assert core._strip_sample_text(" A") == "A"
+    assert core._strip_sample_text("Label: A") == "Label: A"  # プレフィックス無効時は剥がさない
+
+
+def test_choice_sampling_without_prefill(backend, monkeypatch):
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "sampling")
+    monkeypatch.setenv("CHAKUHO_PREFILL", "0")
+    backend.sample_responder = lambda prompt, menu, n: ["A"] * n
+    out = core.choice("s", "pick", {"a": "A", "b": "B"}, backend_url=backend.url, model="fake-model")
+    req = backend.requests[-1]
+    assert "continue_final_message" not in req
+    assert req["messages"][-1]["role"] == "user" and req["messages"][-1]["content"].endswith("Label:")
+    assert out["choice"] == "a"
+    assert out["coverage"] == pytest.approx(1.0)
+
+
+def test_tournament_sampling(backend, monkeypatch):
+    """120 択のトーナメントが sampling 経路でも 2 段で決まり、全リクエストが sampling 形(n あり)。"""
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "sampling")
+    monkeypatch.setenv("CHAKUHO_SAMPLES", "6")
+    options = [f"opt_{i:03d}" for i in range(120)]
+
+    def sample_responder(prompt, menu, n):
+        labels = list(menu)
+        win = labels[-1]  # 各チャンク・決勝とも末尾ラベルが勝つ
+        return [win] * n
+
+    backend.sample_responder = sample_responder
+    out = core.choice("s", "pick", options, backend_url=backend.url)
+    assert out["stages"] == 2
+    assert len(backend.requests) == 4  # 3 チャンク + 決勝
+    for req in backend.requests:
+        assert "n" in req and "logprobs" not in req
+    assert out["coverage"] == pytest.approx(1.0)
+    assert sum(1 for v in out["probabilities"].values() if v > 0) >= 1
+
+
 def test_answer_cue_is_assistant_prefill_by_default(backend, monkeypatch):
     from chakuho import core
     monkeypatch.delenv("CHAKUHO_PREFILL", raising=False)

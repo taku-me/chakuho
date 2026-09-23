@@ -1,8 +1,8 @@
 # chakuho(択法)
 
 Jev 互換の「生成しない判定」エンドポイント。state と、答えの形を宣言した質問を受け取り、
-ローカル LLM(OpenAI 互換 API + logprobs)に 1 トークンだけ出させて、宣言した選択肢上の
-確率分布を返す。文章もコードも座標も出さない。候補は呼ぶ側が実行時に列挙する(AX 木、DOM、タスク一覧など)。
+ローカル LLM(OpenAI 互換 API)に 1 トークンだけ何度も出させ(既定)、または 1 回の logprobs を読み、
+宣言した選択肢上の確率分布を返す。文章もコードも座標も出さない。候補は呼ぶ側が実行時に列挙する(AX 木、DOM、タスク一覧など)。
 
 名前は七覚支の「択法(ちゃくほう)」から。諸法を吟味して正しいものを選び取る働き。
 Jev(TypeSafe)の "System One model" を、手元の汎用モデルで代用するための道具。
@@ -17,10 +17,13 @@ uv run chakuho serve --host 0.0.0.0 --port 9750
 curl -s localhost:9750/health
 ```
 
-backend は vLLM を想定する(`CHAKUHO_BACKEND_URL`、既定 `http://localhost:8006/v1`)。
-Ollama も OpenAI 互換層が `logprobs` / `top_logprobs` を返すので backend にできる(Ollama 0.33 で実測)。
-ただし OpenAI 互換層は thinking を切る指定(`think: false`)を受け付けないため、Qwen3 のような thinking モデルでは
-最初の 1 トークンが思考の書き出しになり判定にならない。Ollama を使うなら instruct モデル(例: `qwen3:4b-instruct-2507`)を指す。
+backend は OpenAI 互換 `/chat/completions`(`CHAKUHO_BACKEND_URL`、既定 `http://localhost:8006/v1`)。
+既定の推定方式(`CHAKUHO_ESTIMATOR=sampling`)は `n` サンプリングにさえ対応していれば動く
+(vLLM / SGLang+投機的デコード / Ollama 等)。`CHAKUHO_ESTIMATOR=logprobs` にする時は
+backend が `logprobs` / `top_logprobs` を返せる必要がある(vLLM、Ollama 0.33 で実測)。
+どちらの方式でも OpenAI 互換層は thinking を切る指定(`think: false`)を受け付けないことがあるため、
+Qwen3 のような thinking モデルでは最初の 1 トークンが思考の書き出しになり判定にならない場合がある。
+instruct モデル(例: `qwen3:4b-instruct-2507`)を指すか `chat_template_kwargs.enable_thinking=false` が効く backend を使う。
 
 ## API
 
@@ -94,12 +97,14 @@ uv run chakuho ask request.json        # ファイルか - で stdin。env CHAKU
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
-| `CHAKUHO_BACKEND_URL` | `http://localhost:8006/v1` | OpenAI 互換 backend(logprobs 必須。vLLM を想定) |
+| `CHAKUHO_BACKEND_URL` | `http://localhost:8006/v1` | OpenAI 互換 backend |
+| `CHAKUHO_ESTIMATOR` | `sampling` | `sampling`(n 回サンプリングして頻度を数える) か `logprobs`(1 回の logprobs を読む。backend が対応している時だけ) |
+| `CHAKUHO_SAMPLES` | `16` | `sampling` の n。不正値は既定値に倒す |
 | `CHAKUHO_MODEL` | backend の `/models` 先頭 | モデル ID。通常は指定しない |
 | `CHAKUHO_LOG_DIR` | `~/.ato/chakuho` | 判定ログ `decisions-YYYYMMDD.jsonl` の置き場(state 全文を含む。較正データの元) |
 | `CHAKUHO_LOG_KEEP_DAYS` | `90` | これより古い日付のログを削除 |
 | `CHAKUHO_MAX_INFLIGHT` | `16` | backend への同時リクエスト上限 |
-| `CHAKUHO_TOP_LOGPROBS` | `20` | backend に要求する top_logprobs 数。`mlx_lm.server` は上限 11。不正値は既定値に倒す |
+| `CHAKUHO_TOP_LOGPROBS` | `20` | `logprobs` 方式で backend に要求する top_logprobs 数。`mlx_lm.server` は上限 11。不正値は既定値に倒す |
 | `CHAKUHO_PREFILL` | `1` | 答えの合図 `Label:` を assistant 側の書き出し(prefill)として送る。`continue_final_message` 非対応の backend では `0`(user 側に書く旧方式) |
 | `CHAKUHO_FALLBACK_BACKEND_URL` | なし | 主 backend が不通の時だけ使う予備 backend。応答の `backend` が `primary` / `fallback` のどちらで答えたかを示す |
 | `CHAKUHO_URL` | `http://localhost:9750/v1/systemone` | クライアント側の宛先 |
@@ -107,8 +112,8 @@ uv run chakuho ask request.json        # ファイルか - で stdin。env CHAKU
 ## 仕組み
 
 1. 選択肢にラベル A〜Z, a〜z を振り、`instructions → options → state → question → "Label:"` の順で prompt を組む(state は末尾)
-2. backend へ `max_tokens=1, temperature=0, logprobs=true, top_logprobs=20`(thinking 無効)で投げる
-3. 返った top logprobs をラベルへ集約し、ラベル内で正規化して分布にする。ラベル外に落ちた質量は coverage の欠けとして報告する
+2. 既定(`sampling`): backend へ `max_tokens=1, temperature=1.0, n=16`(thinking 無効)で投げ、n 個の生成テキストを宣言ラベルへ数え上げて分布にする(logprobs は要求しない)。`logprobs` 方式: `max_tokens=1, temperature=0, logprobs=true, top_logprobs=20` で 1 回だけ投げ、top logprobs をラベルへ集約する
+3. どちらの方式もラベル内で正規化して分布にする。ラベル外に落ちた分は coverage の欠けとして報告する
 
 Jev や NanoJev のような判断専用モデル(判断ヘッドを学習させたもの)ではなく、汎用 instruct モデルの次トークン分布を読む代用品。
 利点は「既に常駐している汎用モデルをそのまま使える」こと、欠点は「候補数の上限(1 ラウンド 52)、較正されていない確率、算術を含む判断の弱さ」。

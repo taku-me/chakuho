@@ -44,8 +44,11 @@ class FakeBackend:
         self.requests: list[dict] = []
         self.prompts: list[str] = []
         self.models_ok = True
-        # responder(prompt, menu) -> top_logprobs dict。既定は先頭ラベル勝ち
+        # responder(prompt, menu) -> top_logprobs dict。既定は先頭ラベル勝ち(logprobs 経路)
         self.responder = lambda prompt, menu: logprobs_for(next(iter(menu)), list(menu))
+        # sample_responder(prompt, menu, n) -> list[str](n 個の生成テキスト)。既定は無指定
+        # (responder の argmax を n 回繰り返す)。sampling 経路(リクエストに "n" がある時)で使う
+        self.sample_responder = None
         self.chat_error: int | None = None  # 例: 500 を返させる
         outer = self
 
@@ -79,6 +82,21 @@ class FakeBackend:
                     self._send(outer.chat_error, {"error": "boom"})
                     return
                 menu = parse_menu(prompt)
+                if "n" in req:  # sampling 経路(query_backend_sampling): logprobs を含まない
+                    n = req["n"]
+                    if outer.sample_responder is not None:
+                        samples = outer.sample_responder(prompt, menu, n)
+                    else:
+                        top = outer.responder(prompt, menu)
+                        samples = [max(top, key=top.get)] * n
+                    self._send(200, {
+                        "choices": [
+                            {"index": i, "message": {"role": "assistant", "content": s}, "finish_reason": "length"}
+                            for i, s in enumerate(samples)
+                        ],
+                        "usage": {"prompt_tokens": len(prompt) // 4},
+                    })
+                    return
                 top = outer.responder(prompt, menu)
                 self._send(200, {
                     "choices": [{"logprobs": {"content": [{"token": max(top, key=top.get), "top_logprobs": [
@@ -99,10 +117,15 @@ class FakeBackend:
 
 @pytest.fixture
 def backend(monkeypatch):
+    """既定は CHAKUHO_ESTIMATOR=logprobs に固定する: 既存テストの大半は aggregate() の
+    数式そのものを検証する目的で書かれており、responder が返す top_logprobs をそのまま
+    使いたいため。sampling 経路のテストは各テスト内で明示的に env を上書きする。"""
     fb = FakeBackend()
     core.clear_model_cache()
     monkeypatch.delenv("CHAKUHO_MODEL", raising=False)
     monkeypatch.delenv("CHAKUHO_MAX_INFLIGHT", raising=False)
+    monkeypatch.setenv("CHAKUHO_ESTIMATOR", "logprobs")
+    monkeypatch.delenv("CHAKUHO_SAMPLES", raising=False)
     core.configure_inflight(16)
     yield fb
     fb.close()
