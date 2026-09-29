@@ -81,6 +81,10 @@ class FakeBackend:
                 if outer.chat_error:
                     self._send(outer.chat_error, {"error": "boom"})
                     return
+                if "OPTIONS:\n" not in prompt:  # /health の生成プローブ("ping")など、メニューを持たない呼び出し
+                    self._send(200, {"choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                                     "usage": {"prompt_tokens": 1}})
+                    return
                 menu = parse_menu(prompt)
                 if "n" in req:  # sampling 経路(query_backend_sampling): logprobs を含まない
                     n = req["n"]

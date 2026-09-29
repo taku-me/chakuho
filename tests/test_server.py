@@ -143,3 +143,15 @@ def test_primary_answer_is_marked_primary(chakuho_server):
     code, out = _post(base + "/v1/systemone", {"state": "s", "questions": {
         "t": {"type": "choice", "instructions": "i", "criteria": {"a": "A", "b": "B"}}}})
     assert code == 200 and out["backend"] == "primary"
+
+
+def test_health_503_when_models_ok_but_generation_fails(chakuho_server, backend):
+    """/models が 200 でも生成が通らない(エンジン固着)時、/health は ok:true を返してはいけない。"""
+    base, _ = chakuho_server
+    backend.chat_error = 500
+    try:
+        urllib_request.urlopen(base + "/health", timeout=10)
+        assert False, "expected 503"
+    except urllib_error.HTTPError as e:
+        body = json.loads(e.read())
+        assert e.code == 503 and body["ok"] is False and "generation probe" in body["error"]

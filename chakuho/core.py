@@ -431,6 +431,35 @@ def resolve_model(backend_url: str, *, timeout: float = BACKEND_TIMEOUT_SEC) -> 
     return probe_backend(backend_url, timeout=timeout)
 
 
+def probe_generation(backend_url: str, model: str, *, timeout: float = BACKEND_TIMEOUT_SEC) -> None:
+    """backend に実際に 1 トークン生成させ、推論エンジンが固着していないかを確かめる。
+
+    /models は GET だけでエンジン本体を通らないため、27B エンジンが固着していても 200 を返す。
+    生存判定(/health)は生成まで通して初めて意味を持つ。失敗・タイムアウトは BackendError。
+    """
+    url = backend_url.rstrip("/") + "/chat/completions"
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    req = urllib_request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise BackendError(f"generation probe to {url} failed: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise BackendError(f"generation probe {url} returned invalid JSON: {exc}") from exc
+    if not isinstance(data, dict) or not data.get("choices"):
+        raise BackendError(f"generation probe {url} returned no choices")
+
+
 def probe_backend(backend_url: str, *, timeout: float = BACKEND_TIMEOUT_SEC) -> str:
     """backend の /models を毎回実際に叩いてモデル ID を返す(キャッシュを使わない。/health の生死判定用)。"""
     url = backend_url.rstrip("/") + "/models"
