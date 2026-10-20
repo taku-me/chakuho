@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from chakuho import core
+from chakuho import core, netsafe
 
 DEFAULT_LOG_DIR = Path.home() / ".ato" / "chakuho"
 DEFAULT_KEEP_DAYS = 90
@@ -78,11 +78,13 @@ def _config_from_env() -> dict[str, Any]:
         "fallback_backend_url": os.environ.get("CHAKUHO_FALLBACK_BACKEND_URL") or None,
         "log_dir": Path(os.environ.get("CHAKUHO_LOG_DIR", str(DEFAULT_LOG_DIR))),
         "keep_days": int(os.environ.get("CHAKUHO_LOG_KEEP_DAYS", str(DEFAULT_KEEP_DAYS))),
+        "max_body_bytes": netsafe.max_body_bytes("CHAKUHO_MAX_BODY_BYTES"),
     }
 
 
 def make_handler(backend_url: str, log: DecisionLog | None,
-                 fallback_backend_url: str | None = None) -> type[BaseHTTPRequestHandler]:
+                 fallback_backend_url: str | None = None,
+                 max_body_bytes: int = netsafe.DEFAULT_MAX_BODY_BYTES) -> type[BaseHTTPRequestHandler]:
     """主 backend が BackendError を返した時だけ fallback_backend_url で同じ判定をやり直す。
     応答には "backend": "primary" | "fallback" を付ける(読む側が縮退を区別できるように)。"""
     class Handler(BaseHTTPRequestHandler):
@@ -127,11 +129,14 @@ def make_handler(backend_url: str, log: DecisionLog | None,
                 self._send(404, {"error": "not found"})
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                req = json.loads(netsafe.read_body(self.headers, self.rfile, max_body_bytes).decode("utf-8"))
                 if not isinstance(req, dict) or "state" not in req or not isinstance(req.get("questions"), dict):
                     raise ValueError("request must be an object with 'state' and 'questions' (object)")
-            except (ValueError, json.JSONDecodeError) as exc:
+            except netsafe.BodyTooLarge as exc:
+                self.close_connection = True  # 読まずに残った本体を次のリクエストと取り違えない
+                self._send(413, {"error": str(exc)})
+                return
+            except (ValueError, UnicodeDecodeError) as exc:
                 self._send(400, {"error": f"bad request: {exc}"})
                 return
             started = time.time()
@@ -158,7 +163,7 @@ def make_handler(backend_url: str, log: DecisionLog | None,
     return Handler
 
 
-def serve(host: str = "0.0.0.0", port: int = 9750, *, backend_url: str | None = None,
+def serve(host: str = netsafe.DEFAULT_HOST, port: int = 9750, *, backend_url: str | None = None,
           fallback_backend_url: str | None = None,
           log_dir: Path | None = None, keep_days: int | None = None) -> ThreadingHTTPServer:
     """サーバを生成して返す(serve_forever は呼び出し側)。"""
@@ -167,6 +172,6 @@ def serve(host: str = "0.0.0.0", port: int = 9750, *, backend_url: str | None = 
     fallback = fallback_backend_url or cfg["fallback_backend_url"]
     log = DecisionLog(log_dir or cfg["log_dir"], keep_days if keep_days is not None else cfg["keep_days"])
     core.configure_inflight()
-    server = ThreadingHTTPServer((host, port), make_handler(backend, log, fallback))
+    server = ThreadingHTTPServer((host, port), make_handler(backend, log, fallback, cfg["max_body_bytes"]))
     server.daemon_threads = True
     return server

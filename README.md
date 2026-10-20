@@ -13,9 +13,15 @@ Jev(TypeSafe)の "System One model" を、手元の汎用モデルで代用す�
 
 ```bash
 uv sync
-uv run chakuho serve --host 0.0.0.0 --port 9750
+uv run chakuho serve --port 9750          # 127.0.0.1 で待ち受け
 curl -s localhost:9750/health
 ```
+
+サーバに認証は無い。既定は `127.0.0.1` だけで待ち受ける。別の機械から呼ぶ時だけ
+`--host 0.0.0.0`(または env `CHAKUHO_HOST`)で明示的に開く。その時は起動時に警告が出る。
+開くのは信頼できるネットワーク内だけにする(届く相手は誰でも backend の推論を呼べ、
+リクエスト本文は判定ログ `CHAKUHO_LOG_DIR` に書かれる)。リクエスト本体は
+`CHAKUHO_MAX_BODY_BYTES`(既定 8 MiB)を超えると 413 で断る。
 
 backend は OpenAI 互換 `/chat/completions`(`CHAKUHO_BACKEND_URL`、既定 `http://localhost:8006/v1`)。
 既定の推定方式(`CHAKUHO_ESTIMATOR=sampling`)は `n` サンプリングにさえ対応していれば動く

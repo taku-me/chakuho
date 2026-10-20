@@ -17,7 +17,10 @@ log_softmax / build_response / validate_request)は mlx 抜きでテストでき
 ``decide()``、``token_text()``)を持つ fake を ``make_handler`` に渡す。
 
 CLI:
-  python3 -m distill.mlx_backend --model <path> --host 0.0.0.0 --port 8006
+  python3 -m distill.mlx_backend --model <path> --port 8006            # 127.0.0.1 で待ち受け
+  python3 -m distill.mlx_backend --model <path> --host 0.0.0.0 --port 8006  # LAN へ開く(認証なし、警告が出る)
+
+既定の待ち受けは 127.0.0.1(env ``CHAKUHO_MLX_HOST`` でも変えられる)。
 """
 
 from __future__ import annotations
@@ -25,8 +28,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Protocol
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from chakuho import netsafe  # noqa: E402
 
 try:
     import mlx_lm  # type: ignore
@@ -184,7 +192,8 @@ class StudentModel:
         return self.tokenizer.decode([token_id])
 
 
-def make_handler(student: StudentLike) -> type[BaseHTTPRequestHandler]:
+def make_handler(student: StudentLike,
+                 max_body_bytes: int = netsafe.DEFAULT_MAX_BODY_BYTES) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "chakuho-mlx-backend/0.1"
 
@@ -210,10 +219,15 @@ def make_handler(student: StudentLike) -> type[BaseHTTPRequestHandler]:
                 self._send(404, {"error": "not found"})
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                body = json.loads(netsafe.read_body(self.headers, self.rfile, max_body_bytes).decode("utf-8"))
+                if not isinstance(body, dict):
+                    raise ValueError("request body must be a JSON object")
                 messages, top_logprobs, enable_thinking = validate_request(body)
-            except (ValueError, json.JSONDecodeError) as exc:
+            except netsafe.BodyTooLarge as exc:
+                self.close_connection = True
+                self._send(413, {"error": str(exc)})
+                return
+            except ValueError as exc:
                 self._send(400, {"error": str(exc)})
                 return
             try:
@@ -235,10 +249,12 @@ def make_handler(student: StudentLike) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def serve(model_path: str, host: str = "0.0.0.0", port: int = 8006) -> ThreadingHTTPServer:
-    """サーバを生成して返す(serve_forever は呼び出し側)。"""
-    student = StudentModel(model_path)
-    server = ThreadingHTTPServer((host, port), make_handler(student))
+def serve(model_path: str, host: str = netsafe.DEFAULT_HOST, port: int = 8006, *,
+          student: StudentLike | None = None) -> ThreadingHTTPServer:
+    """サーバを生成して返す(serve_forever は呼び出し側)。student を渡すとモデルを読み込まない(試験用)。"""
+    student = student or StudentModel(model_path)
+    max_body = netsafe.max_body_bytes("CHAKUHO_MAX_BODY_BYTES")
+    server = ThreadingHTTPServer((host, port), make_handler(student, max_body))
     server.daemon_threads = True
     return server
 
@@ -246,11 +262,14 @@ def serve(model_path: str, host: str = "0.0.0.0", port: int = 8006) -> Threading
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="mlx 変換済みモデルのパス(models/current 等)")
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default=None,
+                    help="待ち受けアドレス(既定: env CHAKUHO_MLX_HOST か 127.0.0.1)。LAN へ開く時だけ明示する。認証は無い")
     ap.add_argument("--port", type=int, default=8006)
     args = ap.parse_args()
-    server = serve(args.model, args.host, args.port)
-    print(f"chakuho mlx backend listening on {args.host}:{args.port} model={args.model}", flush=True)
+    host = netsafe.resolve_host(args.host, "CHAKUHO_MLX_HOST")
+    netsafe.warn_if_exposed(host, args.port, "chakuho mlx backend")
+    server = serve(args.model, host, args.port)
+    print(f"chakuho mlx backend listening on {host}:{args.port} model={args.model}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,6 +1,7 @@
 """Jev 互換のローカル判定エンドポイント。vLLM(qwen3.8-27b)の 1 トークン logprob で答える。
 
-    python3 jev_shim.py --port 9750            # POST /v1/systemone を受ける
+    python3 jev_shim.py --port 9750            # POST /v1/systemone を受ける(127.0.0.1)
+    python3 jev_shim.py --host 0.0.0.0         # LAN へ開く(認証なし、警告が出る)
 
 リクエスト/レスポンスは jev-mario が使う範囲の Jev API 形式:
   req : {"state": <json>, "questions": {name: {"type": choice|noul|score, "instructions": str|dict, "criteria": dict|list}}}
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -136,7 +138,10 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1", help="待ち受けアドレス。LAN へ開く時だけ明示する(認証なし)")
     ap.add_argument("--port", type=int, default=9750)
     a = ap.parse_args()
-    print(f"jev shim on :{a.port} -> {VLLM} ({MODEL})", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
+    if a.host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"WARNING: jev shim は認証なしで {a.host}:{a.port} に待ち受けます", file=sys.stderr, flush=True)
+    print(f"jev shim on {a.host}:{a.port} -> {VLLM} ({MODEL})", flush=True)
+    ThreadingHTTPServer((a.host, a.port), H).serve_forever()
