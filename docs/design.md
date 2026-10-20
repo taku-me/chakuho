@@ -15,7 +15,7 @@ Jev 互換 API なので呼び出し側は将来 Jev 本体や別モデルに差
 
 - 独立リポジトリ github.com/taku-me/chakuho。実行機では git checkout をそのまま systemd から起動する
 - パッケージ `chakuho/`(`core.py` 判定本体 / `server.py` HTTP / `client.py` Python クライアント / `cli.py`)。依存は stdlib のみ、`pyproject.toml` の scripts で `chakuho` コマンドを出す
-- CLI: `chakuho serve [--host 0.0.0.0 --port 9750]` と `chakuho ask <request.json | ->`(env `CHAKUHO_URL`)
+- CLI: `chakuho serve [--host 127.0.0.1 --port 9750]`(既定 127.0.0.1、env `CHAKUHO_HOST`。認証なしなので LAN へ開く時は明示し、起動時に警告) と `chakuho ask <request.json | ->`(env `CHAKUHO_URL`)
 - 起動: 運用側のリポジトリに置いた起動スクリプト + systemd user unit(`chakuho.service`)。このリポジトリには入れない
 - 既存の大きなツール群には同梱しない。呼ぶ側がそれを持つ理由が無いため
 - 設定: env `CHAKUHO_BACKEND_URL`(既定 `http://localhost:8006/v1`)、`CHAKUHO_MODEL`(未指定なら backend の `/models` 先頭を使う。呼び出し側にモデル ID を知らせない)、`CHAKUHO_LOG_DIR`(既定 `~/.ato/chakuho/`)

@@ -98,8 +98,11 @@ print(score_cases(cases, my_decide_fn))
 ### ⑥ 配信(mac)
 
 ```bash
-python3 -m distill.mlx_backend --model models/current --host 0.0.0.0 --port 8006
+python3 -m distill.mlx_backend --model models/current --port 8006   # 127.0.0.1 で待ち受け
 ```
+
+既定の待ち受けは `127.0.0.1`。同じ mac の chakuho から使うならこのままでよい。別の機械から
+直接呼ぶ時だけ `--host 0.0.0.0`(または env `CHAKUHO_MLX_HOST`)で開く(認証なし、起動時に警告が出る)。
 
 OpenAI 互換の `/v1/models`・`/v1/chat/completions`(`max_tokens: 1` 専用)を出す。
 `top_logprobs` はリクエスト側の指定を尊重し(既定 64)、宣言ラベル全部を確実に含められる
@@ -112,7 +115,7 @@ chakuho を student backend に向ける:
 ```bash
 export CHAKUHO_BACKEND_URL=http://localhost:8006/v1
 export CHAKUHO_FALLBACK_BACKEND_URL=http://<gpu-host>:8006/v1   # GPU サーバの vLLM(27B)を予備に
-uv run chakuho serve --host 0.0.0.0 --port 9750
+uv run chakuho serve --port 9750                  # 127.0.0.1。LAN から呼ぶ時だけ --host 0.0.0.0(認証なし)
 ```
 
 `/health` は主 backend が死んでいて予備が生きていれば `{"ok": true, "degraded": true, ...}`

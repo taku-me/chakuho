@@ -85,7 +85,7 @@ GUI 要素選択 336 ケース(実画面 11 枚、112 タスク × 3 変種、`_
 # 実運用の判定ログを、いまの 27B へ流し直して突き合わせる
 python3 bench/replay_against_teacher.py \
     --logs ~/.ato/chakuho/decisions-*.jsonl --last 200 \
-    --teacher http://<gx10>:8006/v1
+    --teacher http://<gpu-host>:8006/v1
 ```
 
 noul と score(Calendar GUI、教師との差):

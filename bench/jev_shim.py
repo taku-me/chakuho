@@ -1,6 +1,7 @@
 """Jev 互換のローカル判定エンドポイント。vLLM(qwen3.8-27b)の 1 トークン logprob で答える。
 
-    python3 jev_shim.py --port 9750            # POST /v1/systemone を受ける
+    python3 jev_shim.py --port 9750            # POST /v1/systemone を受ける(127.0.0.1)
+    python3 jev_shim.py --host 0.0.0.0         # LAN へ開く(認証なし、警告が出る)
 
 リクエスト/レスポンスは jev-mario が使う範囲の Jev API 形式:
   req : {"state": <json>, "questions": {name: {"type": choice|noul|score, "instructions": str|dict, "criteria": dict|list}}}
@@ -13,10 +14,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from chakuho import netsafe  # noqa: E402
 
 VLLM = "http://localhost:8006/v1/chat/completions"
 MODEL = "qwen3.8-27b"
@@ -104,7 +110,7 @@ def systemone(req: dict) -> dict:
     state_text = _text(req["state"]) if not isinstance(req["state"], str) else req["state"]
     qs = req["questions"]
     t0 = time.perf_counter()
-    with ThreadPoolExecutor(max(1, len(qs))) as ex:
+    with ThreadPoolExecutor(max(1, min(len(qs), 16))) as ex:
         results = list(ex.map(lambda kv: answer(state_text, kv[0], kv[1]), qs.items()))
     answers = dict(zip(qs.keys(), results))
     tokens = sum(a.pop("input_tokens", 0) for a in answers.values())
@@ -113,17 +119,27 @@ def systemone(req: dict) -> dict:
 
 
 class H(BaseHTTPRequestHandler):
+    timeout = 30
+
     def log_message(self, *a):  # 静かに
         pass
 
     def do_POST(self):
-        n = int(self.headers.get("Content-Length", 0))
-        req = json.loads(self.rfile.read(n))
+        req: dict = {}
         try:
+            req = json.loads(netsafe.read_body(self.headers, self.rfile, netsafe.max_body_bytes("CHAKUHO_MAX_BODY_BYTES")))
+            if not isinstance(req, dict) or not isinstance(req.get("questions"), dict) or "state" not in req:
+                raise ValueError("request must be an object with 'state' and 'questions' (object)")
             out = systemone(req)
             code = 200
+        except netsafe.BodyTooLarge as e:
+            self.close_connection = True
+            out, code, req = {"error": str(e)}, 413, {}
+        except (ValueError, TypeError, KeyError, AttributeError) as e:
+            out, code = {"error": f"bad request: {type(e).__name__}"}, 400
         except Exception as e:  # noqa: BLE001
-            out, code = {"error": f"{type(e).__name__}: {e}"}, 500
+            print(f"jev shim error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            out, code = {"error": f"backend call failed ({type(e).__name__})"}, 500
         body = json.dumps(out).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -131,12 +147,14 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
         with open("jev_shim.log.jsonl", "a") as fh:
-            fh.write(json.dumps({"t": time.time(), "questions": list(req.get("questions", {})), "resp": out}) + "\n")
+            fh.write(json.dumps({"t": time.time(), "questions": list((req.get("questions") or {}) if isinstance(req, dict) else []), "resp": out}) + "\n")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1", help="待ち受けアドレス。LAN へ開く時だけ明示する(認証なし)")
     ap.add_argument("--port", type=int, default=9750)
     a = ap.parse_args()
-    print(f"jev shim on :{a.port} -> {VLLM} ({MODEL})", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
+    netsafe.warn_if_exposed(a.host, a.port, "jev shim")
+    print(f"jev shim on {a.host}:{a.port} -> {VLLM} ({MODEL})", flush=True)
+    ThreadingHTTPServer((a.host, a.port), H).serve_forever()

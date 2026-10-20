@@ -11,11 +11,13 @@ from chakuho.client import ChakuhoError, decide
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    from chakuho import server
+    from chakuho import netsafe, server
 
-    httpd = server.serve(args.host, args.port)
+    host = netsafe.resolve_host(args.host, "CHAKUHO_HOST")
+    netsafe.warn_if_exposed(host, args.port, "chakuho serve")
+    httpd = server.serve(host, args.port)
     backend = server._config_from_env()["backend_url"]
-    print(f"chakuho {__version__} listening on {args.host}:{args.port} -> {backend}", flush=True)
+    print(f"chakuho {__version__} listening on {host}:{args.port} -> {backend}", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -43,7 +45,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_serve = sub.add_parser("serve", help="Jev 互換の判定サーバを起動する")
-    p_serve.add_argument("--host", default="0.0.0.0")
+    p_serve.add_argument("--host", default=None,
+                         help="待ち受けアドレス(既定: env CHAKUHO_HOST か 127.0.0.1)。"
+                              "LAN へ開く時だけ 0.0.0.0 等を明示する。認証は無い")
     p_serve.add_argument("--port", type=int, default=9750)
     p_serve.set_defaults(func=_cmd_serve)
 

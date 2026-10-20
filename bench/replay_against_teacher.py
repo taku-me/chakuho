@@ -10,7 +10,7 @@
     # 直近 200 件を 27B と突き合わせる
     python3 bench/replay_against_teacher.py \
         --logs ~/.ato/chakuho/decisions-*.jsonl --last 200 \
-        --teacher http://gx10:8006/v1
+        --teacher http://<gpu-host>:8006/v1
 
     # 気になった質問名だけ
     python3 bench/replay_against_teacher.py --logs ... --question target
@@ -48,7 +48,7 @@ def load(paths: list[str], last: int, question: str | None) -> list[dict]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--logs", nargs="+", required=True, help="decisions-*.jsonl(複数可)")
-    ap.add_argument("--teacher", required=True, help="27B の backend URL(例 http://gx10:8006/v1)")
+    ap.add_argument("--teacher", required=True, help="27B の backend URL(例 http://<gpu-host>:8006/v1)")
     ap.add_argument("--last", type=int, default=200, help="末尾 N 件(0 で全件)")
     ap.add_argument("--question", default=None, help="この質問名を含むものだけ")
     ap.add_argument("--show", type=int, default=15, help="食い違いを何件まで出すか")
