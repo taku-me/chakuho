@@ -20,6 +20,8 @@ from chakuho import core, netsafe
 
 DEFAULT_LOG_DIR = Path.home() / ".ato" / "chakuho"
 DEFAULT_KEEP_DAYS = 90
+DEFAULT_MAX_QUESTIONS = 64
+SOCKET_TIMEOUT_S = 30  # 送り切らない接続(slowloris)がスレッドを握り続けないように
 _LOG_NAME_RE = re.compile(r"^decisions-(\d{8})\.jsonl$")
 
 
@@ -79,16 +81,19 @@ def _config_from_env() -> dict[str, Any]:
         "log_dir": Path(os.environ.get("CHAKUHO_LOG_DIR", str(DEFAULT_LOG_DIR))),
         "keep_days": int(os.environ.get("CHAKUHO_LOG_KEEP_DAYS", str(DEFAULT_KEEP_DAYS))),
         "max_body_bytes": netsafe.max_body_bytes("CHAKUHO_MAX_BODY_BYTES"),
+        "max_questions": int(os.environ.get("CHAKUHO_MAX_QUESTIONS", str(DEFAULT_MAX_QUESTIONS))),
     }
 
 
 def make_handler(backend_url: str, log: DecisionLog | None,
                  fallback_backend_url: str | None = None,
-                 max_body_bytes: int = netsafe.DEFAULT_MAX_BODY_BYTES) -> type[BaseHTTPRequestHandler]:
+                 max_body_bytes: int = netsafe.DEFAULT_MAX_BODY_BYTES,
+                 max_questions: int = DEFAULT_MAX_QUESTIONS) -> type[BaseHTTPRequestHandler]:
     """主 backend が BackendError を返した時だけ fallback_backend_url で同じ判定をやり直す。
     応答には "backend": "primary" | "fallback" を付ける(読む側が縮退を区別できるように)。"""
     class Handler(BaseHTTPRequestHandler):
         server_version = "chakuho/0.1"
+        timeout = SOCKET_TIMEOUT_S
 
         def log_message(self, *_args: Any) -> None:  # 標準の 1 行アクセスログは出さない
             return
@@ -132,6 +137,11 @@ def make_handler(backend_url: str, log: DecisionLog | None,
                 req = json.loads(netsafe.read_body(self.headers, self.rfile, max_body_bytes).decode("utf-8"))
                 if not isinstance(req, dict) or "state" not in req or not isinstance(req.get("questions"), dict):
                     raise ValueError("request must be an object with 'state' and 'questions' (object)")
+                if len(req["questions"]) > max_questions:
+                    raise ValueError(f"too many questions ({len(req['questions'])} > {max_questions})")
+                for name, q in req["questions"].items():
+                    if not isinstance(q, dict):
+                        raise ValueError(f"question {name!r} must be an object")
             except netsafe.BodyTooLarge as exc:
                 self.close_connection = True  # 読まずに残った本体を次のリクエストと取り違えない
                 self._send(413, {"error": str(exc)})
@@ -144,7 +154,7 @@ def make_handler(backend_url: str, log: DecisionLog | None,
                 out = core.evaluate(req["state"], req["questions"], backend_url=backend_url)
                 out["backend"] = "primary"
                 code = 200
-            except ValueError as exc:
+            except (ValueError, TypeError, AttributeError) as exc:  # 形の壊れた question は 400(接続を落とさない)
                 out, code = {"error": f"bad request: {exc}"}, 400
             except core.BackendError as exc:
                 out, code = {"error": f"backend unavailable: {exc}"}, 503
@@ -157,7 +167,9 @@ def make_handler(backend_url: str, log: DecisionLog | None,
                     except core.BackendError as exc2:
                         out = {"error": f"backend unavailable: {exc}; fallback unavailable: {exc2}"}
             if log is not None:  # 応答前に書く(読み手が応答直後にログを見ても揃っている)
-                log.append({"t": started, "status": code, "request": req, "response": out})
+                # 400 は本文を残さない(壊れた/悪意ある大きな本文でディスクを埋めさせない)
+                logged = req if code != 400 else {"questions": list(req["questions"])}
+                log.append({"t": started, "status": code, "request": logged, "response": out})
             self._send(code, out)
 
     return Handler
@@ -172,6 +184,7 @@ def serve(host: str = netsafe.DEFAULT_HOST, port: int = 9750, *, backend_url: st
     fallback = fallback_backend_url or cfg["fallback_backend_url"]
     log = DecisionLog(log_dir or cfg["log_dir"], keep_days if keep_days is not None else cfg["keep_days"])
     core.configure_inflight()
-    server = ThreadingHTTPServer((host, port), make_handler(backend, log, fallback, cfg["max_body_bytes"]))
+    server = ThreadingHTTPServer((host, port), make_handler(backend, log, fallback, cfg["max_body_bytes"],
+                                                        cfg["max_questions"]))
     server.daemon_threads = True
     return server

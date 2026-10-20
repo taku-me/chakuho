@@ -137,3 +137,45 @@ def test_mlx_backend_ok_through_serve(servers):
     body = json.dumps({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}).encode()
     code, data = _raw_post(httpd.server_address[1], path, body, str(len(body)))
     assert code == 200 and data["choices"][0]["message"]["content"] == "B"
+
+
+def _post_json(port: int, path: str, payload) -> tuple[int, dict]:
+    body = json.dumps(payload).encode()
+    return _raw_post(port, path, body, str(len(body)))
+
+
+def test_chakuho_rejects_too_many_and_malformed_questions(backend, tmp_path, monkeypatch):
+    monkeypatch.delenv("CHAKUHO_MAX_BODY_BYTES", raising=False)
+    httpd = server.serve(port=0, backend_url=backend.url, log_dir=tmp_path)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port, path = httpd.server_address[1], "/v1/systemone"
+    try:
+        many = {f"q{i}": {"type": "noul"} for i in range(server.DEFAULT_MAX_QUESTIONS + 1)}
+        code, data = _post_json(port, path, {"state": 1, "questions": many})
+        assert code == 400 and "too many questions" in data["error"]
+        code, data = _post_json(port, path, {"state": 1, "questions": {"a": 5}})
+        assert code == 400 and "must be an object" in data["error"]
+        # criteria 欠落は以前 TypeError で接続ごと落ちていた
+        code, data = _post_json(port, path, {"state": {"secret": "x" * 100}, "questions": {"a": {"type": "choice"}}})
+        assert code == 400, data
+        logged = (tmp_path / next(p.name for p in tmp_path.glob("decisions-*.jsonl"))).read_text()
+        assert "xxxxxxxxxx" not in logged  # 400 は本文(state)をログに残さない
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_handlers_have_socket_timeout():
+    assert server.make_handler("http://127.0.0.1:9/v1", None).timeout == server.SOCKET_TIMEOUT_S
+    assert mlx_backend.make_handler(_Fake()).timeout == 30
+
+
+def test_mlx_top_logprobs_capped():
+    with pytest.raises(ValueError):
+        mlx_backend.validate_request({"messages": [{"role": "user", "content": "x"}],
+                                      "top_logprobs": mlx_backend.MAX_TOP_LOGPROBS + 1})
+
+
+def test_core_pool_bounded():
+    from chakuho import core
+    assert core.MAX_POOL_WORKERS <= 32

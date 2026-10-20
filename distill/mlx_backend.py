@@ -45,6 +45,7 @@ except ImportError:  # このリポジトリの開発機には mlx が無い(mac
     _MLX_AVAILABLE = False
 
 DEFAULT_TOP_LOGPROBS = 64
+MAX_TOP_LOGPROBS = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +81,8 @@ def validate_request(body: dict[str, Any]) -> tuple[list[dict[str, str]], int, b
         top_logprobs = int(top_logprobs)
     except (TypeError, ValueError):
         raise ValueError(f"top_logprobs must be an integer (got {top_logprobs!r})") from None
-    if top_logprobs < 1:
-        raise ValueError(f"top_logprobs must be >= 1 (got {top_logprobs})")
+    if not 1 <= top_logprobs <= MAX_TOP_LOGPROBS:
+        raise ValueError(f"top_logprobs must be in 1..{MAX_TOP_LOGPROBS} (got {top_logprobs})")
     template_kwargs = body.get("chat_template_kwargs") or {}
     if not isinstance(template_kwargs, dict):
         raise ValueError("chat_template_kwargs must be an object")
@@ -196,6 +197,7 @@ def make_handler(student: StudentLike,
                  max_body_bytes: int = netsafe.DEFAULT_MAX_BODY_BYTES) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "chakuho-mlx-backend/0.1"
+        timeout = 30  # 送り切らない接続がスレッドを握り続けないように(推論時間には掛からない)
 
         def log_message(self, *_args: Any) -> None:  # アクセスログは出さない(chakuho/server.py と同じ)
             return
@@ -242,7 +244,8 @@ def make_handler(student: StudentLike,
                     prompt_tokens=prompt_tokens,
                 )
             except Exception as exc:  # noqa: BLE001  モデル呼び出し失敗を 500 として返す(サーバを落とさない)
-                self._send(500, {"error": str(exc)})
+                print(f"mlx backend error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                self._send(500, {"error": f"model call failed ({type(exc).__name__})"})
                 return
             self._send(200, response)
 

@@ -66,6 +66,8 @@ NONE_OPTION = "__none__"  # 呼ぶ側が足す「該当なし」。トーナメ�
 # (/get_server_info の max_running_requests はこの制限を反映しない)。
 # journalctl --user -u resident-llm -b | grep 'capped to'
 DEFAULT_MAX_INFLIGHT = 4
+# 1 リクエストが作るスレッド数の上限(backend への同時実行は別途 _inflight で絞る)
+MAX_POOL_WORKERS = 16
 DEFAULT_TOP_LOGPROBS = 20  # mlx_lm.server は上限 11。CHAKUHO_TOP_LOGPROBS で下げる
 
 ESTIMATOR_SAMPLING = "sampling"
@@ -581,7 +583,7 @@ def choice(
         ranked = sorted((o for o in chunk if o != NONE_OPTION), key=lambda o: probs[o], reverse=True)
         return ranked[:top_k], tokens
 
-    with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(chunks), MAX_POOL_WORKERS)) as pool:
         chunk_results = list(pool.map(_run_chunk, chunks))
     winners: list[str] = []
     for chunk_winners, _tokens in chunk_results:
@@ -726,7 +728,7 @@ def evaluate(
         return name, answer
 
     t0 = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=max(1, len(questions))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, min(len(questions), MAX_POOL_WORKERS))) as pool:
         results = list(pool.map(_run, questions.items()))
 
     answers: dict[str, Any] = {}
