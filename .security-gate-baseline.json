@@ -1,0 +1,19 @@
+{
+ "created": "2026-10-21",
+ "note": "既存の違反の指紋。段 2 で減らす。増やす変更はユーザーの承認が要る(docs/security-gate-design.md §3.6)",
+ "count": 2,
+ "findings": [
+  {
+   "rule": "bind.all-interfaces",
+   "path": "bench/jev_shim.py",
+   "fp": "07c90c5dc6686624f96b3657",
+   "hint": "0.0.0.0 で待つ。127.0.0.1(tailnet なら tailscale の IP)に絞る"
+  },
+  {
+   "rule": "bind.all-interfaces",
+   "path": "distill/mlx_backend.py",
+   "fp": "013d55cae652c0e0a7c2fcf5",
+   "hint": "0.0.0.0 で待つ。127.0.0.1(tailnet なら tailscale の IP)に絞る"
+  }
+ ]
+}

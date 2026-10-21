@@ -1,0 +1,16 @@
+# security-gate(公開 repo 用): 艦隊の必須チェック。公開 repo は非公開の fleet-skills の action を呼べないので、公開の写し taku-me/security-gate-action を呼ぶ。この file は変えない
+# 写しは fleet-skills の security_gate/publish_action.sh が置く。正典とのずれは fleet-skills の mirror-check が見る
+# status check の名前は job 名の "security-gate"(branch protection / security-watch の照合がこの名前を見る)
+name: security-gate
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+permissions:
+  contents: read
+jobs:
+  security-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: taku-me/security-gate-action/security-gate@main
