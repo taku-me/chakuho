@@ -113,6 +113,9 @@ uv run chakuho ask request.json        # ファイルか - で stdin。env CHAKU
 | `CHAKUHO_TOP_LOGPROBS` | `20` | `logprobs` 方式で backend に要求する top_logprobs 数。`mlx_lm.server` は上限 11。不正値は既定値に倒す |
 | `CHAKUHO_PREFILL` | `1` | 答えの合図 `Label:` を assistant 側の書き出し(prefill)として送る。`continue_final_message` 非対応の backend では `0`(user 側に書く旧方式) |
 | `CHAKUHO_FALLBACK_BACKEND_URL` | なし | 主 backend が不通の時だけ使う予備 backend。応答の `backend` が `primary` / `fallback` のどちらで答えたかを示す |
+| `CHAKUHO_HOST` | `127.0.0.1` | `serve` の待ち受けアドレス(`--host` が優先) |
+| `CHAKUHO_MAX_BODY_BYTES` | `8388608`(8 MiB) | リクエスト本体の上限。超えると 413 |
+| `CHAKUHO_MAX_QUESTIONS` | `64` | 1 リクエストの質問数の上限(`chakuho/server.py` の `DEFAULT_MAX_QUESTIONS`) |
 | `CHAKUHO_URL` | `http://localhost:9750/v1/systemone` | クライアント側の宛先 |
 
 ## 仕組み
@@ -259,3 +262,19 @@ uv run pytest tests -q      # fake backend で完結、GPU 不要
 
 設計と検証条件は `docs/design.md`、蒸留(MacBook 常駐の小型 backend)は `docs/distill-design.md`。
 ベンチマークのスクリプトは `bench/`(データは含まない。マスク済み AX スナップショットのパスを `AX_SNAPSHOT` で渡す)。
+
+## 運用
+
+- 実行機では git checkout をそのまま systemd user unit(`chakuho.service`)から起動する。unit と起動スクリプトは運用側のリポジトリにあり、この repo には入れない(`docs/design.md`)
+- 生死の確認: `curl -s localhost:9750/health`(backend に 1 トークン生成まで通す)
+- PR の必須検査は `.github/workflows/security-gate.yml`(fleet-skills の security-gate を呼ぶ。この file は変えない)
+
+## 改版履歴
+
+- 2026-10-21 security-gate の caller を置く(公開 repo 用) (#3)
+- 2026-10-21 bench 用依存 pillow を 13.0.0 へ上げる (#2)
+- 2026-10-20 既定で 127.0.0.1 だけで待ち受け、リクエスト本体とスレッド数・質問数に上限、ソケットに timeout (#1)
+- 2026-09-29 `/health` が 1 トークン生成まで通して生死を返す(b51bc98)
+- 2026-09-24 `CHAKUHO_ESTIMATOR=sampling`(n 回サンプリングして頻度を数える)を足し既定にする。`CHAKUHO_MAX_INFLIGHT` の既定を 4 へ(b4d3058)
+- 2026-09-20 答えの合図を assistant prefill にする(`CHAKUHO_PREFILL`)(336f350)
+- 2026-09-19 Jev 互換の判定サーバ・クライアント・CLI、蒸留(`distill/`)、ベンチ(`bench/`)を置く(33d0e98)
